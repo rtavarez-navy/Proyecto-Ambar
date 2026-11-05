@@ -1,0 +1,13 @@
+{
+  "laser_id": "LASER_01",
+  "spreadsheet_id": "COPIAR_ID_DEL_SHEET_DEL_SERVIDOR",
+  "credentials": "google-service-account.json",
+  "lock_directory": "\\\\cs-600\\Control_Produccion_Data\\Kyoodo Corte\\locks",
+  "poll_seconds": 60,
+  "headless": false,
+  "chrome_binary": "",
+  "chromedriver": "",
+  "login_email_selector": "input[placeholder=\"Email Address\"]",
+  "login_password_selector": "input[placeholder=\"Enter Password\"]",
+  "edit_button_selector": ""
+}

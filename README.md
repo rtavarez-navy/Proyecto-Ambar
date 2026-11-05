@@ -103,7 +103,7 @@ python -m venv .venv
 
 En otra consola: `.\.venv\Scripts\python.exe run_client.py`.
 
-GitHub Actions instala dependencias, ejecuta las pruebas y compila ambos ejecutables con PyInstaller. El contrato de integración del bot se documenta en [KYOODO.md](KYOODO.md).
+GitHub Actions instala dependencias, ejecuta las pruebas y compila los tres ejecutables con PyInstaller. El contrato de integración del bot se documenta en [KYOODO.md](KYOODO.md).
 
 ## Límites actuales
 
@@ -129,4 +129,4 @@ El ID CPA se busca por orden + línea y queda congelado en el trabajo. Si falta,
 
 La cola y sus resultados forman parte del respaldo v2; se pueden recuperar respaldos v1 anteriores y migrar su lista de reportes. No reinstalar un servidor antiguo sobre esta versión: el sincronizador anterior reescribe la hoja Kyoodo.
 
-Este repositorio implementa la cola y el contrato de integración. **No incluye todavía la automatización RPA que inicia sesión y modifica el CPA real**. El bot debe consumir este contrato y comprobar el estado en CPA antes de marcar la confirmación.
+El ejecutable **Kyoodo Corte SK2** inicia sesión en CPA con la cuenta de su láser, busca el ID de la línea, actualiza a 0910 y verifica tras recargar. No modifica líneas que ya estén en 0910 o en un estado superior. Configuración y requisito pendiente del botón real de edición en [KYOODO.md](KYOODO.md#preparar-cada-computadora).

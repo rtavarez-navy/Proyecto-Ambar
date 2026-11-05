@@ -2,6 +2,8 @@ name: Ejecutables portátiles Windows
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
@@ -20,12 +22,15 @@ jobs:
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all tzdata --name "Corte SK2 2027" run_client.py
       - name: Compilar servicio central portátil
         run: python -m PyInstaller --noconfirm --clean --onefile --console --collect-all tzdata --collect-all gspread --name "Servidor Corte SK2 2027" run_server.py
+      - name: Compilar Kyoodo por láser
+        run: python -m PyInstaller --noconfirm --clean --onefile --console --collect-all gspread --collect-all selenium --name "Kyoodo Corte SK2" run_kyoodo.py
       - uses: actions/upload-artifact@v4
         with:
           name: Corte-SK2-2027-Windows
           path: |
             dist/*.exe
             server.example.json
+            kyoodo.example.json
             *.cmd
             README.md
             KYOODO.md

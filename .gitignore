@@ -11,3 +11,5 @@ server.json
 *.db-shm
 *.db-wal
 datos/
+kyoodo.json
+*.lock

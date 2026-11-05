@@ -4,9 +4,12 @@ from .core import stamp, text
 PENDING = 'PENDIENTE'
 RETRY = 'REINTENTAR'
 DONE = 'ACTUALIZADA A 910'
+ALREADY = 'YA EN 910'
+HIGHER = 'SUPERIOR A 910'
+TERMINAL = (DONE, ALREADY, HIGHER)
 BLOCKED = 'BLOQUEADA SIN ID CPA'
 MISSING_ID = 'Falta el ID original para esta orden y línea en CPA DATA.'
-STATES = (PENDING, RETRY, DONE, BLOCKED)
+STATES = (PENDING, RETRY, DONE, ALREADY, HIGHER, BLOCKED)
 QUEUE_HEADERS = ['# DE ORDEN', 'LASER', 'SECUENCIA', 'COMENTARIO', 'LINEA', 'ID_REGISTRO', 'ID_CPA', 'ESTADO', 'ORDEN_LINEA', 'FECHA_REGISTRO', 'STATUS_DESTINO', 'LASER_ID']
 
 
@@ -81,10 +84,10 @@ class KyoodoQueue:
                     continue
                 if state not in STATES:
                     raise ValueError('Kyoodo contiene un ESTADO no reconocido.')
-                if state in (PENDING, RETRY, DONE) and not remote_id:
+                if state in (PENDING, RETRY, *TERMINAL) and not remote_id:
                     raise ValueError('Kyoodo: no puede procesarse o confirmarse una fila sin ID_CPA.')
-                if local['state'] == DONE:
-                    if state == DONE and str(row[3]) != local['comment']:
+                if local['state'] in TERMINAL:
+                    if state == local['state'] and str(row[3]) != local['comment']:
                         s.db.execute('UPDATE kyoodo_jobs SET comment=?,updated=? WHERE request_id=?', (str(row[3]), stamp(), key))
                         s._audit('kyoodo', 'KYOODO_COMENTARIO', key)
                     continue  # Nunca volver a encolar un trabajo confirmado.
@@ -126,7 +129,7 @@ def needs_queue_push(remote, current_header, jobs):
         if not entry:
             return True
         row = entry['values']
-        if not row[7] or (row[7] == BLOCKED and job['cpa_id']) or (job['state'] == DONE and row[7] != DONE):
+        if not row[7] or (row[7] == BLOCKED and job['cpa_id']) or (job['state'] in TERMINAL and row[7] != job['state']):
             return True
     return False
 
@@ -154,8 +157,8 @@ def push_queue(book, ws, remote, current_header, jobs):
             changes.append({'range': f"'Kyoodo'!G{position}:H{position}", 'values': [[job['cpa_id'], job['state']]]})
             if row[3] == MISSING_ID:
                 changes.append({'range': f"'Kyoodo'!D{position}", 'values': [['']]})
-        elif job['state'] == DONE and row[7] != DONE:
-            changes.append({'range': f"'Kyoodo'!H{position}", 'values': [[DONE]]})
+        elif job['state'] in TERMINAL and row[7] != job['state']:
+            changes.append({'range': f"'Kyoodo'!H{position}", 'values': [[job['state']]]})
     if changes:
         book.values_batch_update({'valueInputOption': 'RAW', 'data': changes})
     if appended:
