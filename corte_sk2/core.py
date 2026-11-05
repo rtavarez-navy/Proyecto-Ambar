@@ -105,6 +105,8 @@ class Store:
         if 'source_id' not in {r[1] for r in self.db.execute('PRAGMA table_info(cpa)')}:
             self.db.execute("ALTER TABLE cpa ADD COLUMN source_id TEXT NOT NULL DEFAULT ''")
         self.db.commit()
+        from .kyoodo import KyoodoQueue
+        self.kyoodo = KyoodoQueue(self)
 
     def _audit(self, actor, action, detail):
         self.db.execute('INSERT INTO audit(created,actor,action,detail) VALUES(?,?,?,?)', (stamp(), actor, action, detail))
@@ -297,6 +299,7 @@ class Store:
                 return existing['id']
             cur = self.db.execute('INSERT INTO reports(request_id,created,employee,laser_id,ord,line,qty,comment,reprint) VALUES(?,?,?,?,?,?,?,?,?)', (request_id, stamp(), actor, laser_id, order, line, qty, text(comment), int(bool(reprint))))
             self.db.execute('UPDATE reports SET report_date=? WHERE id=?', (report_date, cur.lastrowid))
+            self.kyoodo.ensure_jobs()
             self._audit(actor, 'REPORTE', f'{cur.lastrowid}: {order}|{line} ({qty})')
             return cur.lastrowid
 

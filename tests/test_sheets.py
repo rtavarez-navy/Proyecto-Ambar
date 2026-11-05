@@ -15,6 +15,10 @@ class Worksheet:
     def freeze(self, rows):
         self.frozen_row_count = rows
 
+    def append_rows(self, rows, value_input_option, insert_data_option, table_range):
+        assert value_input_option == 'RAW'
+        self.values.extend([list(row) for row in rows])
+
     def get(self, range_name, value_render_option=None):
         return getattr(self, 'formulas', self.values[1:2])
 
@@ -43,7 +47,21 @@ class Book:
         assert body['valueInputOption'] == 'RAW'
         for data in body['data']:
             name = data['range'].split('!')[0].strip("'").replace("''", "'")
-            self.tabs[name].values = data['values']
+            import re
+            cell = data['range'].split('!')[1].split(':')[0]
+            match = re.fullmatch(r'([A-Z]+)([0-9]+)', cell)
+            col = 0
+            for char in match[1]:
+                col = col * 26 + ord(char) - 64
+            start_col, start_row = col - 1, int(match[2]) - 1
+            values = self.tabs[name].values
+            for offset, row in enumerate(data['values']):
+                target = start_row + offset
+                while len(values) <= target:
+                    values.append([])
+                while len(values[target]) < start_col + len(row):
+                    values[target].append('')
+                values[target][start_col:start_col + len(row)] = list(row)
 
     def worksheet(self, name):
         return self.tabs[name]
@@ -55,7 +73,7 @@ class SheetsTests(unittest.TestCase):
         self.store.bootstrap('S', 'supervisor123')
         self.store.change_password('S', 'supervisor123', 'supervisor456')
         self.store.save_laser('S', 'Láser 01', 'cpa.user')
-        self.store.import_cpa('S', [{'Order': '100', 'Set': 'A', 'Qty': 10}])
+        self.store.import_cpa('S', [{'Order': '100', 'Set': 'A', 'Qty': 10, 'ID': '000100'}])
         self.store.report('S', 'one', '100', 'A', 12, comment='=no_es_formula', laser_id=1)
         self.book = Book()
         self.sync = SheetsSync(self.store, 'test', 'not-used')
@@ -68,7 +86,8 @@ class SheetsTests(unittest.TestCase):
         self.sync.sync()
         self.assertEqual(self.store.snapshot('S')['sync']['sync_error'], '')
         self.assertEqual(self.book.tabs['Consolidado'].values[1][4], '=no_es_formula')
-        self.assertIn('Orden adulterada', self.book.tabs['Kyoodo'].values[1][3])
+        self.assertEqual(self.book.tabs['Kyoodo'].values[1][3], '')
+        self.assertEqual(self.book.tabs['Kyoodo'].values[1][6], '000100')
         self.assertNotIn('Laser 1', self.book.tabs)
         self.assertIn('Láser 01', self.book.tabs)
         formulas = [r['updateCells']['rows'][1]['values'][0]['userEnteredValue']['formulaValue'] for r in self.book.requests if 'updateCells' in r and len(r['updateCells'].get('rows', [])) == 2]

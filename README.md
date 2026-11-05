@@ -12,7 +12,7 @@ El enlace del Sheet se guarda únicamente en el `server.json` privado de la comp
 | `Configuración` | Entrada. Catálogo `LASER_ID`, `NOMBRE`, `HOJA`, `ORDEN`, `ACTIVO`. Catálogo configurable. También refleja cambios realizados desde la aplicación. |
 | `Consolidado` | Salida. Todos los reportes y sus alertas. No editar producción manualmente aquí. |
 | `Láser 01` … `Láser 11` | Vistas automáticas del consolidado filtradas por LASER_ID. No se escriben reportes manualmente en estas hojas. |
-| `Kyoodo` | Salida. Órdenes de mayor a menor, láser, posición, comentario, línea e identificador. No ejecuta acciones CPA. |
+| `Kyoodo` | Cola persistente por reporte. Secuencia estable (primero el menor), ID CPA y destino 910. Kyoodo escribe aquí sus errores y confirmaciones; la sincronización los conserva. Ver `KYOODO.md`. |
 | `Cuentas CPA` | Entrada/salida. Correo y contraseña CPA por LASER_ID y nombre de láser. Se pueden editar en la hoja o desde supervisión en la aplicación. Las contraseñas se guardan legibles por autorización del responsable; no se muestran a operadores ni se incluyen en auditorías. |
 | `Asignaciones` | Salida. Códigos y láseres asignadas por el supervisor. |
 | `CPA DATA` | Order, Set, Prod Line Pieces # e ID original del CPA. Si contiene fórmulas de importación, el servidor las conserva y lee sus resultados; en caso contrario exporta la base cargada desde la aplicación. |
@@ -103,7 +103,7 @@ python -m venv .venv
 
 En otra consola: `.\.venv\Scripts\python.exe run_client.py`.
 
-GitHub Actions instala dependencias, ejecuta las pruebas y compila ambos ejecutables con PyInstaller.
+GitHub Actions instala dependencias, ejecuta las pruebas y compila ambos ejecutables con PyInstaller. El contrato de integración del bot se documenta en [KYOODO.md](KYOODO.md).
 
 ## Límites actuales
 
@@ -118,3 +118,15 @@ GitHub Actions instala dependencias, ejecuta las pruebas y compila ambos ejecuta
 Las importaciones CSV, Excel y SQLite conservan `ID` como texto en `source_id`; no usan el número de fila ni generan un identificador sustituto. Si el archivo no incluye ID, el campo queda vacío. Dos IDs distintos para una misma orden y línea se rechazan para evitar escoger una fila CPA incorrecta.
 
 Si `CPA DATA` ya contiene fórmulas como `IMPORTRANGE`, el servidor no sobrescribe sus celdas. Lee Order, Set, piezas e ID para actualizar la base local; un error de lectura o datos inválidos conserva el maestro anterior. La dirección de origen se configura en la hoja privada y no se publica en este repositorio.
+
+## Cola de Kyoodo
+
+Cada reporte crea su trabajo en la misma transacción SQLite. Reintentar el mismo ID_REGISTRO no duplica el reporte ni la cola. La entrega a Sheets ocurre durante la sincronización; sin conexión se conserva localmente.
+
+Las filas de Kyoodo se agregan como valores RAW, sin fórmulas. No se regeneran ni se ordenan físicamente al sincronizar. La secuencia estable es el orden de creación del reporte, independiente del número de orden y de la fecha de producción digitada.
+
+El ID CPA se busca por orden + línea y queda congelado en el trabajo. Si falta, la fila queda BLOQUEADA SIN ID CPA y se habilita cuando aparece el ID en el maestro. Una confirmación ACTUALIZADA A 910 es definitiva. Las filas completadas se conservan, no se borran.
+
+La cola y sus resultados forman parte del respaldo v2; se pueden recuperar respaldos v1 anteriores y migrar su lista de reportes. No reinstalar un servidor antiguo sobre esta versión: el sincronizador anterior reescribe la hoja Kyoodo.
+
+Este repositorio implementa la cola y el contrato de integración. **No incluye todavía la automatización RPA que inicia sesión y modifica el CPA real**. El bot debe consumir este contrato y comprobar el estado en CPA antes de marcar la confirmación.

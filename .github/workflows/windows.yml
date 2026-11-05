@@ -28,4 +28,6 @@ jobs:
             server.example.json
             *.cmd
             README.md
+            KYOODO.md
           retention-days: 30
+

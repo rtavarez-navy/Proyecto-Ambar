@@ -4,8 +4,10 @@ import re
 import threading
 import time
 from .core import identifier, stamp, text
+from .kyoodo import read_remote_queue, needs_queue_push, push_queue, QUEUE_HEADERS
 
-TABLES = ('lasers', 'users', 'cpa', 'reports', 'audit')
+LEGACY_TABLES = ('lasers', 'users', 'cpa', 'reports', 'audit')
+TABLES = LEGACY_TABLES + ('kyoodo_jobs',)
 SPREADSHEET_ID = ''
 HEADERS = ['FECHA', '# DE ORDEN', 'LINEA', '# PIEZAS', 'COMENTARIOS', 'LASER_ID', 'CODIGO_EMPLEADO', 'NOMBRE_OPERADOR', 'HORA_REGISTRO', 'ID_REGISTRO', 'VALIDACION', 'ALERTA', 'REPRINT']
 CONFIG_HEADERS = ['LASER_ID', 'NOMBRE', 'HOJA', 'ORDEN', 'ACTIVO']
@@ -103,6 +105,13 @@ class SheetsSync:
                 if not values or values[0][:4] != ['Order', 'Set', 'Prod Line Pieces #', 'ID']:
                     raise ValueError('CPA DATA requiere Order, Set, Prod Line Pieces # e ID.')
                 s.import_cpa_sheet([dict(zip(values[0], row)) for row in values[1:]])
+        queue_ws = worksheets.get('Kyoodo')
+        if queue_ws is None:
+            queue_ws = book.add_worksheet('Kyoodo', rows=1000, cols=len(QUEUE_HEADERS))
+            worksheets['Kyoodo'] = queue_ws
+        remote_queue, current_queue_header = read_remote_queue(queue_ws)
+        s.kyoodo.resolve_missing_ids()
+        s.kyoodo.merge_results(remote_queue)
         with s.lock:
             meta = dict(s.db.execute('SELECT key,value FROM meta'))
             config_dirty = meta.get('config_dirty') == '1'
@@ -138,7 +147,8 @@ class SheetsSync:
                         if old['cpa_account'] != account or old['cpa_password'] != password:
                             s.db.execute('UPDATE lasers SET cpa_account=?,cpa_password=? WHERE id=?', (account, password, old['id']))
                             s._audit('sistema', 'CUENTA_CPA_SHEETS', key)
-            if not s.db.execute("SELECT 1 FROM meta WHERE key='dirty' AND value='1'").fetchone():
+            queue_jobs = s.kyoodo.jobs()
+            if not s.db.execute("SELECT 1 FROM meta WHERE key='dirty' AND value='1'").fetchone() and not needs_queue_push(remote_queue, current_queue_header, queue_jobs):
                 with s.db:
                     s.db.execute("INSERT INTO meta VALUES('sync_error','') ON CONFLICT(key) DO UPDATE SET value=''")
                 return
@@ -200,17 +210,16 @@ class SheetsSync:
             if str(ws.id) not in formatted:
                 requests += formatting_requests(ws.id)
                 formatted.add(str(ws.id))
-        ordered = sorted(rows, key=lambda r: (int(r['ord']) if r['ord'].isdigit() else -1, r['ord'], r['id']), reverse=True)
-        write('Kyoodo', [['# DE ORDEN', 'LASER', 'SECUENCIA', 'COMENTARIO', 'LINEA', 'ID_REGISTRO']] + [[r['ord'], r['laser'], i, ' | '.join(filter(None, [r['comment'], r['alert']])), r['line'], r['request_id']] for i, r in enumerate(ordered, 1)])
+        push_queue(book, queue_ws, remote_queue, current_queue_header, queue_jobs)
         write('Asignaciones', [['CODIGO_EMPLEADO', 'NOMBRE', 'LASER_ID']] + [[r['code'], r['name'], laser_map[r['laser_id']]['external_id'] if r['laser_id'] in laser_map else ''] for r in snapshot['employees']])
         write('Cuentas CPA', [['LASER_ID', 'LASER', 'CORREO', 'CONTRASEÑA']] + [[r['external_id'], r['name'], r['cpa_account'], r['cpa_password']] for r in snapshot['lasers']])
         if not cpa_has_formulas:
             write('CPA DATA', [['Order', 'Set', 'Prod Line Pieces #', 'ID']] + [[r['ord'], r['line'], r['qty'], r['source_id']] for r in tables['cpa']])
         if config_dirty:
             write('Configuración', config)
-        payload = json.dumps({'version': 1, 'tables': tables}, ensure_ascii=False)
+        payload = json.dumps({'version': 2, 'tables': tables}, ensure_ascii=False)
         chunks = [payload[i:i + 30000] for i in range(0, len(payload), 30000)]
-        write('_Estado', [['Corte SK2 backup v1', 'JSON (no editar)']] + [[i, chunk] for i, chunk in enumerate(chunks)])
+        write('_Estado', [['Corte SK2 backup v2', 'JSON (no editar)']] + [[i, chunk] for i, chunk in enumerate(chunks)])
         requests.append({'updateSheetProperties': {'properties': {'sheetId': worksheets['_Estado'].id, 'hidden': True}, 'fields': 'hidden'}})
         # Estructura y fórmulas primero; un solo batch RAW para los datos.
         if requests:
@@ -231,16 +240,17 @@ class SheetsSync:
                 raise ValueError('La recuperación solo se permite sobre una base local vacía.')
         cells = self.book().worksheet('_Estado').get_all_values()
         payload = json.loads(''.join(row[1] for row in cells[1:] if len(row) > 1))
-        if payload.get('version') != 1 or set(payload['tables']) != set(TABLES):
+        if payload.get('version') not in (1, 2) or set(payload['tables']) not in (set(TABLES), set(LEGACY_TABLES)):
             raise ValueError('Respaldo no compatible.')
         with s.lock, s.db:
             for table in TABLES:
                 allowed = {r[1] for r in s.db.execute(f'PRAGMA table_info({table})')}
-                for row in payload['tables'][table]:
+                for row in payload['tables'].get(table, []):
                     if not set(row) <= allowed:
                         raise ValueError('Columnas de respaldo inválidas.')
                     columns = list(row)
                     s.db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", [row[k] for k in columns])
+            s.kyoodo.ensure_jobs()
             s._audit('sistema', 'RESTAURACION', 'Recuperado desde Google Sheets')
 
     def run(self):
