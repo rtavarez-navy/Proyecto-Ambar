@@ -1,59 +1,70 @@
-# Contrato de integración de Kyoodo
+# Kyoodo · servicio Google por láser
 
-La hoja `Kyoodo` es una cola persistente. Las nuevas filas se agregan como valores, nunca con fórmulas. El bot existente debe adaptarse a este contrato antes de habilitarlo contra CPA; esta aplicación todavía no ejecuta la automatización RPA.
+La cola sigue en el Sheet. Cada PC ejecuta su Kyoodo, pero las lecturas/reservas y los resultados pasan por la API HTTPS. No distribuir el JSON de Google ni dar acceso directo al Sheet a operadores.
 
-## Columnas
+## Autenticación
 
-| Columna | Encabezado | Responsable |
-| --- | --- | --- |
-| A | # DE ORDEN | Servidor: orden original |
-| B | LASER | Servidor: nombre al reportar |
-| C | SECUENCIA | Servidor: entero estable; menor = más viejo |
-| D | COMENTARIO | Bot: error o detalle del resultado. Inicialmente vacío, salvo motivo de bloqueo |
-| E | LINEA | Servidor: set |
-| F | ID_REGISTRO | Servidor: clave única e inmutable del reporte |
-| G | ID_CPA | Servidor: ID original del maestro para orden + línea |
-| H | ESTADO | Bot en filas habilitadas; servidor para creación, desbloqueo y protección de confirmaciones |
-| I | ORDEN_LINEA | Servidor: `ORDEN|SET`, como valor |
-| J | FECHA_REGISTRO | Servidor: hora real de recepción, con zona horaria |
-| K | STATUS_DESTINO | Servidor: 910 |
-| L | LASER_ID | Servidor: clave para buscar correo y contraseña en Cuentas CPA |
+- `POST /login` con `code` y `password` devuelve `token` y `user`.
+- En primer acceso, usar `/password` con `old` y `new`. El usuario debe haber sido asignado a una láser por supervisión.
+- En las siguientes solicitudes enviar `Authorization: Bearer TOKEN`.
+- El código y clave son los de acceso a Corte. El correo/clave de CPA se obtienen solo al reservar un trabajo propio; no son las credenciales de acceso a la aplicación.
 
-`COMENTARIO` es del bot. El comentario del operador permanece en el consolidado y en la vista de su láser.
+## Tomar el próximo trabajo
 
-## Estados
+`POST /kyoodo/next` con un `request_id` UUID nuevo para esa solicitud. Si se pierde la respuesta, repetir con **el mismo UUID** hasta obtener confirmación. Esto devuelve la misma reserva, no otra orden.
 
-- `PENDIENTE`: preparado para intentar actualizar CPA.
-- `REINTENTAR`: falló; D describe el motivo. Se vuelve a intentar en el siguiente ciclo.
-- `BLOQUEADA SIN ID CPA`: no ejecutar. El servidor resolverá el ID al actualizar el maestro; entonces escribirá ID_CPA y PENDIENTE juntos.
-- `ACTUALIZADA A 910`: confirmación definitiva, excluir de próximas ejecuciones. No eliminar la fila ni reutilizar su ID_REGISTRO.
+Respuesta con trabajo:
 
-Una fila representa un reporte. Dos reportes distintos de la misma orden y línea conservan dos identificadores de reporte. El estado 910 en CPA se debe comprobar antes de repetir la actualización, para que estos reportes o una respuesta perdida no causen acciones duplicadas.
+```json
+{
+  "job": {
+    "# DE ORDEN": "SO-0000000",
+    "LINEA": "A",
+    "ID_REGISTRO": "uuid-del-reporte",
+    "ID_CPA": "id-original-cpa",
+    "ESTADO": "EN PROCESO",
+    "STATUS_DESTINO": 910,
+    "LASER_ID": "LASER_01",
+    "CLAIM_ID": "reserva-aleatoria"
+  },
+  "account": {"email": "cuenta-de-esta-laser", "password": "clave-cpa"}
+}
+```
 
-## Ciclo de trabajo del bot
+Solo se reservan filas propias habilitadas, comenzando por la SECUENCIA más baja. No se usa el número de orden ni la fecha de producción para determinar antigüedad. Si no hay trabajo, `job` es null. Si ya existe una reserva vigente para esa láser y otra solicitud, devuelve `busy: true`; no iniciar otro proceso.
 
-1. Leer encabezados y filas; usar `corte_sk2.kyoodo.actionable_rows(values)` para obtener PENDIENTE/REINTENTAR con ID, ordenadas por SECUENCIA ascendente.
-2. Dar como máximo un intento a cada fila en ese ciclo y continuar con las siguientes si una falla. El siguiente ciclo vuelve a leer la hoja.
-3. Buscar correo y contraseña por LASER_ID en Cuentas CPA. Si falta acceso, escribir el error y REINTENTAR; no cambiar de cuenta arbitrariamente.
-4. Volver a localizar la fila por **ID_REGISTRO** y comprobar que siga habilitada antes de actuar. No guardar números de fila entre ciclos.
-5. Leer en CPA la fila con ID_CPA y comprobar que corresponda a la orden y línea esperadas. Si ya está en 910, confirmar sin volver a modificarla. Si no, actualizar a 910 y verificar el resultado en CPA.
-6. Volver a localizar ID_REGISTRO y escribir D y H como valores RAW en una misma solicitud de Google. Nunca marcar éxito antes de verificarlo en CPA.
-7. Ante un fallo, guardar el motivo en D y `REINTENTAR` en H. Ante éxito confirmado, guardar una nota o dejar D vacío y escribir `ACTUALIZADA A 910` en H.
+La reserva dura 600 segundos. Si un ejecutor desaparece, otro puede retomarla después; se genera un CLAIM_ID nuevo y el anterior ya no permite confirmar. Si una respuesta de CPA se perdió, leer el estado real antes de volver a modificarlo.
 
-No escribir el error en otras columnas; no incluir contraseñas en mensajes de error. No deducir trabajo pendiente solo del comentario: **el estado gobierna los reintentos**.
+## Ejecutar y confirmar
 
-## Concurrencia y preservación
+1. Abrir sesión en CPA con la cuenta que devuelve la API para esa láser.
+2. Buscar ID_CPA en la orden indicada y verificar que corresponda a su línea.
+3. Si el estado ya es 910, confirmar sin repetir la actualización. Si no, actualizar y comprobar el resultado en CPA.
+4. `POST /kyoodo/result` con:
 
-Ejecutar una sola instancia del bot para esta cola. No ordenar físicamente, borrar ni insertar filas intermedias mientras trabaja. Para inspección, usar vistas de filtro sin reordenar la fuente compartida. El servidor únicamente agrega filas y no reescribe D/H de trabajos habilitados durante una sincronización normal.
+```json
+{
+  "request_id": "uuid-del-reporte",
+  "claim_id": "reserva-aleatoria",
+  "state": "ACTUALIZADA A 910",
+  "comment": "Confirmado en CPA"
+}
+```
 
-Si el bot escribe un resultado mientras el servidor sincroniza, ese resultado se leerá en el siguiente ciclo y se conservará en el respaldo. Una confirmación guardada no puede volver a pendiente; si se cambia por error, el servidor restablece ACTUALIZADA A 910. Si se elimina una fila cuyo resultado ya se había sincronizado, se repone con el estado conservado. Si se borra antes de sincronizar el resultado, ese resultado no puede recuperarse: por eso el contrato exige conservar las filas.
+En caso de fallo, enviar `state: "REINTENTAR"` y el error en `comment`. No incluir contraseñas ni tokens en el comentario. Repetir la misma confirmación si su respuesta se pierde: una confirmación completada es idempotente.
 
-Un envío al Sheet cuya respuesta se pierde se verifica por ID_REGISTRO antes de volver a agregarlo. Cualquier ID_REGISTRO ajeno o duplicado detiene la sincronización para evitar sobrescribir datos de otra base.
+Un error no se deduce solamente del comentario: **ESTADO gobierna el reintento**. Dar como máximo un intento por registro en cada ciclo del bot, y evitar bucles inmediatos sobre el mismo fallo. Cuando no haya trabajo, espaciar las consultas (por ejemplo 60 segundos); aumentar la espera ante 429/503.
 
-Los ID_CPA asignados no cambian al importar otro maestro. Los bloqueados sí se resuelven cuando el ID aparece. El estado destino de esta integración es fijo en 910.
+## Columnas de Kyoodo
 
-## Recuperación y cambio de versión
+| Columnas | Uso |
+| --- | --- |
+| A–F | # DE ORDEN, LASER, SECUENCIA, COMENTARIO, LINEA, ID_REGISTRO |
+| G–L | ID_CPA, ESTADO, ORDEN_LINEA, FECHA_REGISTRO, STATUS_DESTINO, LASER_ID |
+| M–P | CLAIM_ID, CLAIM_EXPIRA, INTENTOS, CLAIM_REQUEST_ID |
 
-El respaldo técnico v2 incluye `kyoodo_jobs`, sus secuencias y resultados. La recuperación lee primero los resultados que sigan en la hoja antes de publicar nuevas filas. Los respaldos v1 se pueden recuperar; sus reportes se convierten en trabajos pendientes o bloqueados según el ID disponible. Si ya hubo procesamiento fuera de esta cola, revisar CPA antes de ejecutar esa migración.
+Los datos son valores, no fórmulas. El ID_REGISTRO no cambia y el ID_CPA asignado queda congelado. Si el ID falta, el estado es BLOQUEADA SIN ID CPA hasta que aparezca en el maestro. Las filas ACTUALIZADA A 910 se conservan como historial y no se vuelven a reservar.
 
-No ejecutar el sincronizador antiguo junto al nuevo: el antiguo regenera Kyoodo y puede borrar sus resultados. Actualizar y reiniciar la única instancia central.
+No borrar ni ordenar físicamente filas. No escribir resultados directamente en celdas: usar la API evita conflictos entre operadores, revisiones del servicio y ejecutores. Los comentarios del operador están en Consolidado, separados del error del bot.
+
+Esta API no navega ni actualiza el CPA por sí sola. El ejecutor RPA debe adaptarse al contrato y probarse con la cuenta de cada láser antes de habilitarlo en producción.

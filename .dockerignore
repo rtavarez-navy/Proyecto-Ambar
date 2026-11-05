@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+*.db
+*.json
+*.zip
+datos
+build
+dist
+project_sources
+cloud.env.yaml
+*.pem

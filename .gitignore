@@ -11,3 +11,8 @@ server.json
 *.db-shm
 *.db-wal
 datos/
+
+
+CorteSK2.json
+cloud.env.yaml
+*.pem

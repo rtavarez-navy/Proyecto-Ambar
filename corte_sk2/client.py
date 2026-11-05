@@ -1,5 +1,7 @@
 """Cliente portátil de escritorio. Todas las autorizaciones se verifican en servidor."""
 import json
+import os
+import sys
 import queue
 import threading
 import tkinter as tk
@@ -19,24 +21,34 @@ RED = '#541d2a'
 YELLOW = '#544515'
 
 
+class TransportError(ValueError):
+    """La respuesta no confirma si la escritura se completó."""
+
+
 class API:
     def __init__(self, url):
+        if not url.startswith('https://'):
+            raise ValueError('Usa la dirección HTTPS del servicio de Corte en Google.')
         self.url = url.rstrip('/')
         self.token = ''
 
     def call(self, path, **data):
         request = Request(self.url + path, data=json.dumps(data).encode(), headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + self.token})
         try:
-            with urlopen(request, timeout=45) as response:
+            with urlopen(request, timeout=90) as response:
                 return json.load(response)
         except HTTPError as exc:
             try:
                 detail = json.load(exc).get('error', 'Error del servidor.')
             except (ValueError, AttributeError):
                 detail = f'Error HTTP {exc.code}'
+            if exc.code >= 500 or exc.code in (408, 429):
+                raise TransportError(detail) from None
             raise ValueError(detail) from None
         except (URLError, TimeoutError, OSError):
-            raise ValueError('Sin conexión con el servidor central. Comprueba la red y que el servidor esté abierto.') from None
+            raise TransportError('Sin conexión con Google. Comprueba Internet y reintenta el mismo envío.') from None
+        except (ValueError, UnicodeDecodeError):
+            raise TransportError('Google devolvió una respuesta no confirmada. Reintenta el mismo envío.') from None
 
 
 class Desktop(tk.Tk):
@@ -65,7 +77,7 @@ class Desktop(tk.Tk):
         self.pending_report = None
         self.frame = ttk.Frame(self, padding=24)
         self.frame.pack(fill='both', expand=True)
-        self.status = tk.StringVar(value='Conecta con el servicio central de planta')
+        self.status = tk.StringVar(value='Conecta con Corte en Google Sheets')
         ttk.Label(self, textvariable=self.status, foreground=MUTED, padding=(24, 10)).pack(fill='x')
         self.after(100, self.pump)
         self.login_screen()
@@ -112,14 +124,25 @@ class Desktop(tk.Tk):
         box = ttk.Frame(self.frame, padding=35)
         box.place(relx=.5, rely=.45, anchor='center', width=480)
         self.title_block(box, 'CORTE SK2 / 2027', 'CONTROL DE PRODUCCIÓN  /  SAKIRA 2')
-        self.url = tk.StringVar(value='http://localhost:8765')
+        self.url = tk.StringVar(value='')
         config = Path.home() / 'CorteSK2-cliente.json'
         try:
             self.url.set(json.loads(config.read_text(encoding='utf-8'))['server'])
         except (OSError, ValueError, KeyError):
             pass
+        portable = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path.cwd()
+        try:
+            configured = json.loads((portable / 'CorteSK2.json').read_text(encoding='utf-8')).get('server')
+            if configured:
+                self.url.set(configured)
+        except (OSError, ValueError):
+            pass
+        if os.environ.get('CORTE_API_URL'):
+            self.url.set(os.environ['CORTE_API_URL'])
+        if not self.url.get().startswith('https://'):
+            self.url.set('')
         self.code, self.password = tk.StringVar(), tk.StringVar()
-        for label, variable, secret in [('Servidor central', self.url, False), ('Código de empleado', self.code, False), ('Clave', self.password, True)]:
+        for label, variable, secret in [('Dirección HTTPS de Corte en Google', self.url, False), ('Código de empleado', self.code, False), ('Clave', self.password, True)]:
             ttk.Label(box, text=label).pack(anchor='w', pady=(8, 3))
             entry = ttk.Entry(box, textvariable=variable, show='•' if secret else '')
             entry.pack(fill='x')
@@ -129,8 +152,8 @@ class Desktop(tk.Tk):
 
     def login(self):
         url, code, password = self.url.get().strip(), self.code.get().strip(), self.password.get()
-        if not url.startswith(('http://', 'https://')):
-            messagebox.showerror('Servidor', 'Usa una dirección http:// o https:// completa.')
+        if not url.startswith('https://'):
+            messagebox.showerror('Conexión', 'Pega la dirección HTTPS del servicio desplegado en Google.')
             return
         self.api = API(url)
         def success(result):
@@ -187,7 +210,7 @@ class Desktop(tk.Tk):
             self.make_management()
             self.make_charts()
         self.paint(data)
-        self.poll_id = self.after(5000, self.poll)
+        self.poll_id = self.after(60000, self.poll)
 
     def logout(self):
         if self.busy:
@@ -282,7 +305,7 @@ class Desktop(tk.Tk):
                 return self.api.call('/report', request_id=request_id, **fields)
             except ValueError as exc:
                 # Los errores de validación son definitivos; los de red pueden ocultar un guardado exitoso.
-                if not str(exc).startswith('Sin conexión'):
+                if not isinstance(exc, TransportError):
                     return {'validation_error': str(exc)}
                 raise
         def done(result):
@@ -294,9 +317,12 @@ class Desktop(tk.Tk):
             for variable in (self.order, self.line, self.qty, self.comment):
                 variable.set('')
             self.reprint.set(False)
-            self.status.set(f"Registro #{result['id']} guardado en el servidor · sincronización con Sheets pendiente")
+            self.status.set(f"Registro #{result['id']} guardado en Google Sheets")
             self.order_entry.focus_set()
-            self.refresh()
+            if result.get('snapshot'):
+                self.paint(result['snapshot'])
+            else:
+                self.refresh()
         self.job(work, done)
 
     def laser_id(self, name):
@@ -305,7 +331,7 @@ class Desktop(tk.Tk):
     def make_management(self):
         toolbar = ttk.Frame(self.management_tab)
         toolbar.pack(fill='x', pady=(0, 15))
-        for index, (label, command) in enumerate([('Nuevo empleado', self.add_employee), ('Nueva láser', self.add_laser), ('Editar láser / cuenta CPA', self.edit_laser), ('Quitar asignación', self.unassign), ('Activar / desactivar', self.toggle_laser), ('Cargar base CPA', self.import_cpa), ('Sincronizar Sheets', self.sync)]):
+        for index, (label, command) in enumerate([('Nuevo empleado', self.add_employee), ('Nueva láser', self.add_laser), ('Editar láser / cuenta CPA', self.edit_laser), ('Quitar asignación', self.unassign), ('Activar / desactivar', self.toggle_laser), ('Cargar base CPA', self.import_cpa), ('Actualizar desde Sheets', self.sync)]):
             ttk.Button(toolbar, text=label, command=command).grid(row=index // 4, column=index % 4, sticky='ew', padx=(0, 6), pady=3)
         ttk.Label(self.management_tab, text='Arrastra un empleado de la izquierda sobre su láser. También puedes seleccionarlos y pulsar ASIGNAR.', foreground=MUTED).pack(anchor='w', pady=12)
         body = ttk.Frame(self.management_tab)
@@ -404,7 +430,7 @@ class Desktop(tk.Tk):
         self.job(work, done)
 
     def sync(self):
-        self.job(lambda: self.api.call('/sync'), lambda _: self.status.set('Sincronización solicitada. El estado se actualizará automáticamente.'))
+        self.job(lambda: self.api.call('/sync'), lambda _: self.status.set('Datos actualizados directamente en Google Sheets.'))
 
     def make_charts(self):
         self.summary = tk.StringVar()
@@ -477,7 +503,7 @@ class Desktop(tk.Tk):
             self.draw_chart()
         self.paint_rows()
         sync = data['sync']
-        state = sync['sync_error'] or ('Pendiente de sincronizar con Sheets' if sync['dirty'] == '1' else 'Sheets sincronizado')
+        state = sync['sync_error'] or 'Conectado a Google Sheets'
         self.status.set(f"{state}  ·  Última sincronización: {sync['sync_at'] or 'ninguna'}  ·  CPA: {data['cpa_lines']:,} líneas / {data['cpa_updated']}")
 
     def paint_rows(self):
@@ -504,7 +530,7 @@ class Desktop(tk.Tk):
         if self.data is None:
             return
         self.job(lambda: self.api.call('/snapshot'), self.paint, quiet=True)
-        self.poll_id = self.after(5000, self.poll)
+        self.poll_id = self.after(60000, self.poll)
 
 
 def main():

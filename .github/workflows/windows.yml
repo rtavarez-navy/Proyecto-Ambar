@@ -14,19 +14,17 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: python -m pip install -r requirements-build.txt
+      - run: python -m pip install -r requirements-build.txt "Flask>=3.0,<4" "google-cloud-storage>=2.18,<4"
       - run: python -m unittest discover -s tests -v
       - name: Compilar aplicación portátil
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --collect-all tzdata --name "Corte SK2 2027" run_client.py
-      - name: Compilar servicio central portátil
-        run: python -m PyInstaller --noconfirm --clean --onefile --console --collect-all tzdata --collect-all gspread --name "Servidor Corte SK2 2027" run_server.py
       - uses: actions/upload-artifact@v4
         with:
           name: Corte-SK2-2027-Windows
           path: |
             dist/*.exe
-            server.example.json
-            *.cmd
+            client.example.json
+            CLOUD.md
             README.md
             KYOODO.md
           retention-days: 30

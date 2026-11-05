@@ -1,132 +1,87 @@
-# Corte SK2 2027
+# Corte SK2 2027 · Google Sheets
 
-Aplicación portátil para Windows en Python + Tkinter, negro y verde neón. Reporte provisional de corte independiente de Ámbar.
+Aplicación portátil de Windows en Python, negro y verde neón. **Ya no necesita una PC encendida como servidor central**: el cliente se conecta por HTTPS a un servicio Python alojado en Google Cloud Run. **Google Sheets es la base de datos central**, sin una base SQLite operativa en planta.
 
-## Configurar el Sheet de la planta
+> Esta versión está preparada para desplegar. No trae una dirección de servicio publicada: primero debe completarse [CLOUD.md](CLOUD.md), configurar el proyecto y probar el servicio real. La conexión de Google de ChatGPT no autoriza automáticamente al ejecutable.
 
-El enlace del Sheet se guarda únicamente en el `server.json` privado de la computadora central. No se publica en el repositorio. **Falta proporcionar ese enlace y una credencial local de Google y probar el servicio en la computadora central.** La cuenta conectada a ChatGPT permite preparar el Sheet desde una conversación, pero no se transfiere a los ejecutables.
+## En cada PC
 
-| Hoja | Dirección de los datos |
+1. Descargar el artefacto de la última ejecución exitosa en GitHub Actions → Ejecutables portátiles Windows.
+2. Extraer y abrir `Corte SK2 2027.exe`.
+3. Pegar la dirección HTTPS del servicio desplegado. La dirección se recuerda por usuario de Windows.
+4. Entrar con el código del empleado; la primera clave es `123456` y obliga a cambiarla a una nueva de al menos 8 caracteres.
+
+Opcionalmente, copiar `client.example.json` como `CorteSK2.json`, colocar allí la dirección real y dejarlo junto al ejecutable en todas las PC. No contiene contraseñas ni claves administrativas. También se puede configurar `CORTE_API_URL`.
+
+Las PC necesitan Internet. No necesitan instalar Python ni guardar un JSON de Google. La aplicación no usa `localhost`, carpetas compartidas ni un proceso servidor en la PC del supervisor. No volver a ejecutar el sincronizador local antiguo sobre el mismo Sheet.
+
+## Datos y permisos
+
+| Hoja | Uso |
 | --- | --- |
-| `Maestro` | Entrada. Lee `APELLIDOS_NOMBRES` y `CODIGO_EMPLEADO`; no modifica la hoja. Agrega operadores nuevos con `123456` y actualiza nombres sin reiniciar claves ni asignaciones. No elimina usuarios por retirarlos del maestro. |
-| `Configuración` | Entrada. Catálogo `LASER_ID`, `NOMBRE`, `HOJA`, `ORDEN`, `ACTIVO`. Catálogo configurable. También refleja cambios realizados desde la aplicación. |
-| `Consolidado` | Salida. Todos los reportes y sus alertas. No editar producción manualmente aquí. |
-| `Láser 01` … `Láser 11` | Vistas automáticas del consolidado filtradas por LASER_ID. No se escriben reportes manualmente en estas hojas. |
-| `Kyoodo` | Cola persistente por reporte. Secuencia estable (primero el menor), ID CPA y destino 910. Kyoodo escribe aquí sus errores y confirmaciones; la sincronización los conserva. Ver `KYOODO.md`. |
-| `Cuentas CPA` | Entrada/salida. Correo y contraseña CPA por LASER_ID y nombre de láser. Se pueden editar en la hoja o desde supervisión en la aplicación. Las contraseñas se guardan legibles por autorización del responsable; no se muestran a operadores ni se incluyen en auditorías. |
-| `Asignaciones` | Salida. Códigos y láseres asignadas por el supervisor. |
-| `CPA DATA` | Order, Set, Prod Line Pieces # e ID original del CPA. Si contiene fórmulas de importación, el servidor las conserva y lee sus resultados; en caso contrario exporta la base cargada desde la aplicación. |
-| `_Estado` | Respaldo técnico oculto, creado por el servidor al sincronizar. Incluye hashes de acceso, credenciales CPA e historial. |
+| `Maestro` | Nombres y códigos de empleados. Se lee sin modificarla. Actualizar el nombre no reinicia claves. |
+| `Configuración` | Láseres, nombres de hojas, orden y ACTIVO. Agregar o desactivar conserva el historial. |
+| `Consolidado` | Reportes: FECHA, # DE ORDEN, LINEA, # PIEZAS, COMENTARIOS y trazabilidad. |
+| Hojas por láser | Vistas del consolidado; cada operador solo recibe los datos de su láser asignada. |
+| `Kyoodo` | Cola persistente, ID CPA, destino 910, estados y reservas temporales por trabajo. |
+| `Cuentas CPA` | Láser, correo y contraseña de su cuenta CPA. Las credenciales son legibles en el Sheet por autorización del responsable. |
+| `Asignaciones` | Relación entre empleados y láseres; se puede gestionar por arrastre desde supervisión. |
+| `CPA DATA` | Order, Set, piezas e ID original. Se conservan las fórmulas de importación existentes. |
+| `_Usuarios` | Códigos, hash de clave, rol y versión de acceso. |
+| `_Sesiones` | Hashes de tokens de sesión, vencimiento y versión de clave. |
+| `_Accesos` | Control persistente de intentos fallidos de acceso. |
+| `_Auditoria` | Registro acumulativo de operaciones. |
 
-La sincronización consulta las entradas cada 60 segundos, incluso si no hubo reportes nuevos. Un cambio pendiente de láser realizado en la aplicación tiene prioridad en el próximo ciclo; para correo/contraseña, solo prevalecen las cuentas modificadas localmente; evitar editar ese mismo catálogo simultáneamente desde ambos lugares.
+Las hojas técnicas se ocultan, pero ocultarlas **no** es una barrera de seguridad frente a editores del archivo. Solo supervisión y la identidad del servicio deben acceder al Sheet; los operadores acceden únicamente a través de la aplicación.
 
-El Sheet y el respaldo local contienen credenciales CPA legibles. No compartirlos con operadores ni compartir el JSON de Google. Ocultar `_Estado` no protege su contenido frente a personas con acceso al archivo.
+El servicio valida la sesión y la asignación en cada solicitud. Un operador no puede elegir otra láser cambiando los datos enviados desde su PC. Una nueva clave invalida las otras sesiones del mismo código. Las credenciales CPA de otra láser no se devuelven a operadores.
 
-## Descargar los programas
+## Registro y validación
 
-GitHub → **Actions → Ejecutables portátiles Windows → ejecución exitosa → Artifacts → Corte-SK2-2027-Windows**. Descargar y extraer el ZIP.
+Un envío guarda el reporte y su trabajo Kyoodo **en la misma solicitud atómica de Sheets**, antes de responder que quedó guardado. Si se pierde la respuesta, el cliente conserva el identificador y permite reintentar sin duplicarlo. No cerrar la aplicación mientras haya un envío sin confirmar; si se cerró, revisar el reporte antes de capturarlo nuevamente.
 
-- `Corte SK2 2027.exe`: cliente de operadores y supervisión.
-- `Servidor Corte SK2 2027.exe`: un único servicio central para todas las terminales.
-- `Conectar-Google.cmd`: asistente de conexión de Google.
-- `Iniciar-servidor.cmd`: inicia el servicio desde su carpeta.
-
-No necesitan instalar Python. Los ejecutables no están firmados digitalmente. Comprobar compilación, arranque y funcionamiento en Windows antes de distribuir a planta.
-
-## Conectar Google en la computadora central
-
-1. Crear una cuenta de servicio en Google Cloud y habilitar Google Sheets API y Google Drive API en su proyecto. Descargar su clave JSON al equipo central; no enviarla por chat ni subirla al repositorio.
-2. Extraer los ejecutables en una carpeta del disco local con permiso de escritura. Ejecutar `Conectar-Google.cmd`.
-3. El asistente pide la ruta del JSON y el enlace de tu Sheet, guarda una copia local como `google-service-account.json` y muestra el correo de la cuenta de servicio.
-4. Compartir el Sheet de corte como **Editor** con ese correo. Volver a la consola y pulsar Enter. El asistente verifica el acceso y las hojas esperadas.
-5. Si es un servidor nuevo, introducir el código del supervisor y una clave inicial de al menos 8 caracteres. El supervisor deberá cambiar esa clave en la primera entrada a la aplicación.
-6. Mantener el servicio abierto. Abrir el cliente en ese equipo con `http://localhost:8765`; desde otras terminales, usar `http://NOMBRE-PC-CENTRAL:8765` o su IP fija. Permitir el puerto TCP 8765 solamente en la red privada de planta.
-7. Entrar como supervisor, cambiar clave, pulsar «Sincronizar Sheets», comprobar los empleados y las 11 láseres, asignar operadores por arrastre y cargar el maestro CPA.
-8. Comprobar un reporte y su sincronización en el consolidado, la láser correspondiente y Kyoodo antes de usarlo en producción.
-
-Si ya existe un `server.json` de una versión anterior con `spreadsheet_id` vacío, ejecutar el asistente para completar esa configuración. Las rutas relativas se resuelven respecto a `server.json`.
-
-Para conectarlo desde Python:
-
-```powershell
-.\.venv\Scripts\python.exe run_server.py --connect-google
-```
-
-## Operación
-
-El operador entra con código de empleado y clave inicial `123456`; debe cambiarla a una nueva de al menos 8 caracteres. Solo puede reportar en su láser asignada. Sin asignación, aparece el mensaje de espera.
-
-Los cinco campos del reporte son **FECHA, # DE ORDEN, LINEA, # PIEZAS y COMENTARIOS**. La fecha se introduce como `AAAA-MM-DD` y es independiente de la hora real de registro. La orden admite `ORDEN|SET`. Reprint se conserva como dato adicional.
-
-El supervisor ve producción diaria, gráficos, duplicados y alertas. Puede gestionar láseres, asignar empleados y cargar CPA `.db`, `.csv` UTF-8 o `.xlsx`. En la base `.db`, se usa la tabla `cpa_lines` con columnas entrecomilladas `Order`, `Set`, `Prod Line Pieces #` o `Qty`; nunca `Order Prod Lines #` como cantidad.
-
-| Validación | Resultado |
+| Situación | Resultado |
 | --- | --- |
-| Misma orden + línea en una o varias láseres | Todas las filas involucradas en rojo, indicando láseres |
-| Suma de piezas de orden + línea superior al CPA | Rojo y «Orden adulterada» |
-| Orden o línea inexistente | Amarillo y mensaje de revisión; si también es duplicada, prevalece rojo |
+| Misma orden + línea en una o varias láseres | Todas las filas involucradas en rojo |
+| Piezas acumuladas superiores al CPA | Rojo y «Orden adulterada» |
+| Orden o línea inexistente en CPA | Amarillo y mensaje de revisión; si además está duplicada, prevalece rojo |
+| Falta el ID CPA | Reporte conservado, trabajo Kyoodo bloqueado hasta resolverlo |
 
-Las alertas se conservan y no bloquean la captura. Los totales incluyen las filas con incidencias. El acumulado y los duplicados consideran todo el historial, no solo el día. Al cambiar el maestro CPA se recalculan las alertas.
+El acumulado considera todo el historial. Los totales incluyen las filas con incidencias. La fecha de producción es editable y se guarda separada de la hora real de recepción. Se admite `ORDEN|SET` en el campo de orden.
 
-## Agregar o quitar láseres
+La aplicación consulta novedades automáticamente cada 60 segundos para moderar el consumo de cuota; registrar producción actualiza la pantalla con la respuesta del mismo envío. También hay actualización manual. No se necesita un sincronizador de fondo: los datos están en Sheets al confirmar el guardado.
 
-Desde la aplicación: **LÁSERES Y EQUIPO → Nueva láser**, o seleccionar una y usar **Activar / desactivar**. Se conserva el historial y al desactivar se quitan las asignaciones.
+## Kyoodo por láser
 
-Desde `Configuración`: agregar una fila con un LASER_ID único estable (por ejemplo `LASER_12`), nombre, nombre de hoja exclusivo, orden entero y ACTIVO marcado. El servicio creará la vista automáticamente. Desmarcar ACTIVO para quitarla de la captura; no borrar ni reutilizar identificadores históricos. Las hojas históricas no se eliminan automáticamente.
+Ver [KYOODO.md](KYOODO.md). El ejecutor debe autenticarse y usar `/kyoodo/next` y `/kyoodo/result`. Solo recibe trabajos y credenciales de su láser. El servicio reserva un trabajo durante 10 minutos para impedir que dos ejecutores tomen la misma orden simultáneamente.
 
-## Almacenamiento y recuperación
+No usar el consumidor anterior que escribía directamente en las celdas: no participa del bloqueo de escrituras. La automatización RPA que navega y modifica el CPA real sigue siendo una integración separada; este repositorio expone su contrato y control de cola.
 
-Un servicio central conserva un **almacén transaccional SQLite en disco local** y sincroniza con Sheets. Esta versión usa el Sheet como directorio, configuración, reporte compartido y respaldo; **no es un programa con Google Sheets como único almacenamiento**. Las terminales se conectan al servicio y no reciben credenciales de Google.
+## Despliegue y migración
 
-Usar una sola instancia central. No colocar la base SQLite activa en una carpeta SMB. No exponer el puerto HTTP a Internet; para proteger credenciales en tránsito, usar un proxy HTTPS y su URL en los clientes.
+Seguir [CLOUD.md](CLOUD.md). El servicio usa una cuenta de servicio de Google adjunta a Cloud Run, **sin descargar ni repartir claves JSON**. Requiere proyecto, APIs, permisos y configuración de facturación de Google Cloud; no se garantiza coste cero.
 
-La pantalla diferencia guardado local, pendiente de sincronización y última sincronización. Si encuentra registros en el consolidado ajenos a la base local, detiene las escrituras en lugar de sobrescribirlos. Recuperar el respaldo existente antes de continuar.
+Las escrituras se coordinan con un objeto privado en Cloud Storage, que contiene únicamente metadatos de bloqueo. La producción, usuarios, sesiones, asignaciones y resultados permanecen en Sheets. El bucket no se usa como otra base de producción.
 
-Conservar copias de seguridad de `datos/corte.db` con el servicio cerrado. Si se pierde la base, preparar una configuración apuntando al mismo Sheet y a una base inexistente, y ejecutar:
+Si existe `_Estado` de la versión local, la primera inicialización migra sus hashes de acceso y asignaciones al nuevo formato, conservando los reportes y resultados ya presentes en las hojas. Primero sincronizar y detener la versión local. Los reportes que todavía estén solo en el disco deben entregarse a Sheets antes de migrar.
 
-```powershell
-& '.\Servidor Corte SK2 2027.exe' --restore-sheet
-```
+No borrar ni reordenar físicamente filas de las tablas mientras opera el servicio. Las modificaciones desde la aplicación y el bot pasan por el servicio. Durante mantenimiento, detener el tráfico antes de editar manualmente producción o sesiones.
 
-Restaura solamente sobre una base vacía. Recupera hasta el último respaldo completado; las filas pendientes requieren recuperar el disco local original. No editar `_Estado`.
-
-## Desarrollo y pruebas
+## Desarrollo
 
 Python 3.11 o posterior:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt Flask google-cloud-storage
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe run_server.py
+.\.venv\Scripts\python.exe run_client.py
 ```
 
-En otra consola: `.\.venv\Scripts\python.exe run_client.py`.
+Para servir la API se usa la imagen `Dockerfile` en Cloud Run. El módulo es `corte_sk2.cloud:create_app()`. El arranque se prueba desde Linux con Gunicorn; no se requiere ese proceso en las PC Windows.
 
-GitHub Actions instala dependencias, ejecuta las pruebas y compila ambos ejecutables con PyInstaller. El contrato de integración del bot se documenta en [KYOODO.md](KYOODO.md).
+Los módulos SQLite y el sincronizador antiguo se conservan para pruebas y recuperación de la versión previa. No forman parte del almacenamiento del nuevo servicio y el ejecutable de servidor local ya no se compila ni se distribuye.
 
-## Límites actuales
+## Verificación pendiente en Google y planta
 
-- No captura filas nuevas sin conexión al servicio. Si una respuesta se pierde, reintentar sin modificar el formulario conserva el mismo identificador y evita duplicar. No cerrar el cliente hasta resolver un envío pendiente.
-- Las correcciones auditadas de producción, aprobación de reprints y recuperación de claves olvidadas aún no tienen interfaz.
-- La visualización del cliente se actualiza cada 5 segundos; Sheets cada 60. Medir rendimiento y cuotas con el volumen real antes del despliegue general.
-- Las pruebas de sincronización usan un adaptador de Google simulado. El acceso real desde el ejecutable requiere la configuración local descrita arriba; debe verificarse también con escáneres y pantallas de planta.
-
-
-## ID original de CPA
-
-Las importaciones CSV, Excel y SQLite conservan `ID` como texto en `source_id`; no usan el número de fila ni generan un identificador sustituto. Si el archivo no incluye ID, el campo queda vacío. Dos IDs distintos para una misma orden y línea se rechazan para evitar escoger una fila CPA incorrecta.
-
-Si `CPA DATA` ya contiene fórmulas como `IMPORTRANGE`, el servidor no sobrescribe sus celdas. Lee Order, Set, piezas e ID para actualizar la base local; un error de lectura o datos inválidos conserva el maestro anterior. La dirección de origen se configura en la hoja privada y no se publica en este repositorio.
-
-## Cola de Kyoodo
-
-Cada reporte crea su trabajo en la misma transacción SQLite. Reintentar el mismo ID_REGISTRO no duplica el reporte ni la cola. La entrega a Sheets ocurre durante la sincronización; sin conexión se conserva localmente.
-
-Las filas de Kyoodo se agregan como valores RAW, sin fórmulas. No se regeneran ni se ordenan físicamente al sincronizar. La secuencia estable es el orden de creación del reporte, independiente del número de orden y de la fecha de producción digitada.
-
-El ID CPA se busca por orden + línea y queda congelado en el trabajo. Si falta, la fila queda BLOQUEADA SIN ID CPA y se habilita cuando aparece el ID en el maestro. Una confirmación ACTUALIZADA A 910 es definitiva. Las filas completadas se conservan, no se borran.
-
-La cola y sus resultados forman parte del respaldo v2; se pueden recuperar respaldos v1 anteriores y migrar su lista de reportes. No reinstalar un servidor antiguo sobre esta versión: el sincronizador anterior reescribe la hoja Kyoodo.
-
-Este repositorio implementa la cola y el contrato de integración. **No incluye todavía la automatización RPA que inicia sesión y modifica el CPA real**. El bot debe consumir este contrato y comprobar el estado en CPA antes de marcar la confirmación.
+Las pruebas automatizadas usan una implementación simulada de Sheets y prueban autenticación, atomicidad, concurrencia, recuperación de sesión y reservas. Aún se debe verificar el despliegue real, permisos, cuota con las 11 láseres, tiempos de respuesta, ejecutable Windows y ejecución del bot contra CPA.
