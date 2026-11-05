@@ -93,6 +93,16 @@ class SheetsSync:
         if 'Maestro' not in worksheets or 'Configuración' not in worksheets:
             raise ValueError('No se encontraron Maestro y Configuración en el Sheet.')
         master = worksheets['Maestro'].get_all_values()
+        cpa_has_formulas = False
+        if 'CPA DATA' in worksheets:
+            cpa_ws = worksheets['CPA DATA']
+            formulas = cpa_ws.get('A2:D2', value_render_option='FORMULA')
+            cpa_has_formulas = any(isinstance(v, str) and v.startswith('=') for row in formulas for v in row)
+            if cpa_has_formulas:
+                values = cpa_ws.get_all_values()
+                if not values or values[0][:4] != ['Order', 'Set', 'Prod Line Pieces #', 'ID']:
+                    raise ValueError('CPA DATA requiere Order, Set, Prod Line Pieces # e ID.')
+                s.import_cpa_sheet([dict(zip(values[0], row)) for row in values[1:]])
         with s.lock:
             meta = dict(s.db.execute('SELECT key,value FROM meta'))
             config_dirty = meta.get('config_dirty') == '1'
@@ -102,25 +112,31 @@ class SheetsSync:
                 config = worksheets['Configuración'].get_all_values()
             employees, lasers = parse_directory(master, config)
             s.import_directory(employees, lasers)
-            if not config_dirty and 'Cuentas CPA' in worksheets:
+            if 'Cuentas CPA' in worksheets:
                 accounts = worksheets['Cuentas CPA'].get_all_values()
-                if accounts and accounts[0][:3] != ['LASER_ID', 'LASER', 'CUENTA_CPA']:
-                    raise ValueError('Cuentas CPA requiere LASER_ID, LASER, CUENTA_CPA.')
+                legacy_accounts = accounts and accounts[0][:3] == ['LASER_ID', 'LASER', 'CUENTA_CPA']
+                if accounts and not legacy_accounts and accounts[0][:4] != ['LASER_ID', 'LASER', 'CORREO', 'CONTRASEÑA']:
+                    raise ValueError('Cuentas CPA requiere LASER_ID, LASER, CORREO, CONTRASEÑA.')
+                pending = set(json.loads(meta.get('cpa_credentials_pending', '[]')))
                 with s.db:
                     seen = set()
                     for row in accounts[1:]:
-                        row = list(row) + [''] * 3
-                        key, account = text(row[0]), text(row[2])
+                        row = list(row) + [''] * 4
+                        key, account, password = text(row[0]), text(row[2]), str(row[3])
                         if not key:
                             continue
                         if key in seen:
                             raise ValueError('Cuentas CPA contiene un LASER_ID duplicado.')
                         seen.add(key)
-                        old = s.db.execute('SELECT id,cpa_account FROM lasers WHERE external_id=?', (key,)).fetchone()
+                        old = s.db.execute('SELECT id,cpa_account,cpa_password FROM lasers WHERE external_id=?', (key,)).fetchone()
                         if old is None:
                             raise ValueError('Cuentas CPA contiene un LASER_ID que no existe en Configuración.')
-                        if old['cpa_account'] != account:
-                            s.db.execute('UPDATE lasers SET cpa_account=? WHERE id=?', (account, old['id']))
+                        if key in pending:
+                            continue
+                        if legacy_accounts:
+                            password = old['cpa_password']
+                        if old['cpa_account'] != account or old['cpa_password'] != password:
+                            s.db.execute('UPDATE lasers SET cpa_account=?,cpa_password=? WHERE id=?', (account, password, old['id']))
                             s._audit('sistema', 'CUENTA_CPA_SHEETS', key)
             if not s.db.execute("SELECT 1 FROM meta WHERE key='dirty' AND value='1'").fetchone():
                 with s.db:
@@ -187,8 +203,9 @@ class SheetsSync:
         ordered = sorted(rows, key=lambda r: (int(r['ord']) if r['ord'].isdigit() else -1, r['ord'], r['id']), reverse=True)
         write('Kyoodo', [['# DE ORDEN', 'LASER', 'SECUENCIA', 'COMENTARIO', 'LINEA', 'ID_REGISTRO']] + [[r['ord'], r['laser'], i, ' | '.join(filter(None, [r['comment'], r['alert']])), r['line'], r['request_id']] for i, r in enumerate(ordered, 1)])
         write('Asignaciones', [['CODIGO_EMPLEADO', 'NOMBRE', 'LASER_ID']] + [[r['code'], r['name'], laser_map[r['laser_id']]['external_id'] if r['laser_id'] in laser_map else ''] for r in snapshot['employees']])
-        write('Cuentas CPA', [['LASER_ID', 'LASER', 'CUENTA_CPA']] + [[r['external_id'], r['name'], r['cpa_account']] for r in snapshot['lasers']])
-        write('CPA DATA', [['Order', 'Set', 'Prod Line Pieces #']] + [[r['ord'], r['line'], r['qty']] for r in tables['cpa']])
+        write('Cuentas CPA', [['LASER_ID', 'LASER', 'CORREO', 'CONTRASEÑA']] + [[r['external_id'], r['name'], r['cpa_account'], r['cpa_password']] for r in snapshot['lasers']])
+        if not cpa_has_formulas:
+            write('CPA DATA', [['Order', 'Set', 'Prod Line Pieces #', 'ID']] + [[r['ord'], r['line'], r['qty'], r['source_id']] for r in tables['cpa']])
         if config_dirty:
             write('Configuración', config)
         payload = json.dumps({'version': 1, 'tables': tables}, ensure_ascii=False)
@@ -204,6 +221,7 @@ class SheetsSync:
             if current == revision:
                 s.db.execute("UPDATE meta SET value='0' WHERE key='dirty'")
                 s.db.execute("UPDATE meta SET value='0' WHERE key='config_dirty'")
+                s.db.execute("UPDATE meta SET value='[]' WHERE key='cpa_credentials_pending'")
             for key, value in [('sync_at', stamp()), ('sync_error', ''), ('formatted_tabs', json.dumps(sorted(formatted)))]:
                 s.db.execute('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, value))
     def restore_empty(self):
@@ -242,3 +260,4 @@ def formatting_requests(sid):
     for color, rgb in [('red', {'red': 1, 'green': .72, 'blue': .72}), ('yellow', {'red': 1, 'green': .92, 'blue': .55})]:
         requests.append({'addConditionalFormatRule': {'index': 0, 'rule': {'ranges': [{'sheetId': sid, 'startRowIndex': 1, 'startColumnIndex': 0, 'endColumnIndex': 13}], 'booleanRule': {'condition': {'type': 'CUSTOM_FORMULA', 'values': [{'userEnteredValue': f'=$L2="{color}"'}]}, 'format': {'backgroundColor': rgb, 'textFormat': {'foregroundColor': {'red': .1, 'green': .05, 'blue': .05}}}}}}})
     return requests
+

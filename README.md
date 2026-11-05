@@ -13,14 +13,14 @@ El enlace del Sheet se guarda únicamente en el `server.json` privado de la comp
 | `Consolidado` | Salida. Todos los reportes y sus alertas. No editar producción manualmente aquí. |
 | `Láser 01` … `Láser 11` | Vistas automáticas del consolidado filtradas por LASER_ID. No se escriben reportes manualmente en estas hojas. |
 | `Kyoodo` | Salida. Órdenes de mayor a menor, láser, posición, comentario, línea e identificador. No ejecuta acciones CPA. |
-| `Cuentas CPA` | Entrada/salida. Cuenta CPA de referencia por LASER_ID, sin contraseñas. Se puede editar en la hoja o en la aplicación. |
+| `Cuentas CPA` | Entrada/salida. Correo y contraseña CPA por LASER_ID y nombre de láser. Se pueden editar en la hoja o desde supervisión en la aplicación. Las contraseñas se guardan legibles por autorización del responsable; no se muestran a operadores ni se incluyen en auditorías. |
 | `Asignaciones` | Salida. Códigos y láseres asignadas por el supervisor. |
-| `CPA DATA` | Salida del maestro CPA importado desde la aplicación. |
-| `_Estado` | Respaldo técnico oculto, creado por el servidor al sincronizar. Incluye hashes de acceso e historial. |
+| `CPA DATA` | Order, Set, Prod Line Pieces # e ID original del CPA. Si contiene fórmulas de importación, el servidor las conserva y lee sus resultados; en caso contrario exporta la base cargada desde la aplicación. |
+| `_Estado` | Respaldo técnico oculto, creado por el servidor al sincronizar. Incluye hashes de acceso, credenciales CPA e historial. |
 
-La sincronización consulta las entradas cada 60 segundos, incluso si no hubo reportes nuevos. Un cambio pendiente de láser o cuenta CPA realizado en la aplicación tiene prioridad en el próximo ciclo; evitar editar ese mismo catálogo simultáneamente desde ambos lugares.
+La sincronización consulta las entradas cada 60 segundos, incluso si no hubo reportes nuevos. Un cambio pendiente de láser realizado en la aplicación tiene prioridad en el próximo ciclo; para correo/contraseña, solo prevalecen las cuentas modificadas localmente; evitar editar ese mismo catálogo simultáneamente desde ambos lugares.
 
-No compartir el Sheet con operadores ni compartir el JSON de Google. Ocultar `_Estado` no protege su contenido frente a personas con acceso al archivo.
+El Sheet y el respaldo local contienen credenciales CPA legibles. No compartirlos con operadores ni compartir el JSON de Google. Ocultar `_Estado` no protege su contenido frente a personas con acceso al archivo.
 
 ## Descargar los programas
 
@@ -111,3 +111,10 @@ GitHub Actions instala dependencias, ejecuta las pruebas y compila ambos ejecuta
 - Las correcciones auditadas de producción, aprobación de reprints y recuperación de claves olvidadas aún no tienen interfaz.
 - La visualización del cliente se actualiza cada 5 segundos; Sheets cada 60. Medir rendimiento y cuotas con el volumen real antes del despliegue general.
 - Las pruebas de sincronización usan un adaptador de Google simulado. El acceso real desde el ejecutable requiere la configuración local descrita arriba; debe verificarse también con escáneres y pantallas de planta.
+
+
+## ID original de CPA
+
+Las importaciones CSV, Excel y SQLite conservan `ID` como texto en `source_id`; no usan el número de fila ni generan un identificador sustituto. Si el archivo no incluye ID, el campo queda vacío. Dos IDs distintos para una misma orden y línea se rechazan para evitar escoger una fila CPA incorrecta.
+
+Si `CPA DATA` ya contiene fórmulas como `IMPORTRANGE`, el servidor no sobrescribe sus celdas. Lee Order, Set, piezas e ID para actualizar la base local; un error de lectura o datos inválidos conserva el maestro anterior. La dirección de origen se configura en la hoja privada y no se publica en este repositorio.

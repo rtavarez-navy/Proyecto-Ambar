@@ -15,6 +15,9 @@ class Worksheet:
     def freeze(self, rows):
         self.frozen_row_count = rows
 
+    def get(self, range_name, value_render_option=None):
+        return getattr(self, 'formulas', self.values[1:2])
+
     def get_all_values(self):
         return self.values
 
@@ -160,7 +163,36 @@ class SheetsTests(unittest.TestCase):
         self.sync.sync()
         self.assertEqual(self.store.snapshot('S')['lasers'][0]['cpa_account'], 'new.cpa.user')
 
+    def test_credentials_round_trip_and_local_edit_preserves_password(self):
+        self.sync.sync()
+        self.book.tabs['Cuentas CPA'].values[1][2:] = ['operator@example.test', ' 001$ecret ']
+        self.sync.sync()
+        laser = self.store.snapshot('S')['lasers'][0]
+        self.assertEqual(laser['cpa_password'], ' 001$ecret ')
+        self.assertEqual(laser['cpa_account'], 'operator@example.test')
+        self.store.save_laser('S', 'Láser 01 renombrada', laser['cpa_account'], 1)
+        self.sync.sync()
+        self.assertEqual(self.book.tabs['Cuentas CPA'].values[1][3], ' 001$ecret ')
+        self.store.save_laser('S', 'Láser 01 renombrada', 'new@example.test', 1, 'new.secret')
+        self.sync.sync()
+        self.assertEqual(self.book.tabs['Cuentas CPA'].values[1][2:], ['new@example.test', 'new.secret'])
+
+    def test_cpa_id_export_and_import_formula_preservation(self):
+        self.store.import_cpa('S', [{'Order': '100', 'Set': 'A', 'Qty': 10, 'ID': '000123'}])
+        self.sync.sync()
+        self.assertEqual(self.book.tabs['CPA DATA'].values[0][3], 'ID')
+        self.assertEqual(self.book.tabs['CPA DATA'].values[1][3], '000123')
+        sheet = self.book.tabs['CPA DATA']
+        sheet.formulas = [['=IMPORTRANGE("source","A2:A")']]
+        sheet.values = [['Order', 'Set', 'Prod Line Pieces #', 'ID'], ['200', 'B', 30, '00999']]
+        self.sync.sync()
+        self.assertEqual(self.store.snapshot('S')['sync']['sync_error'], '')
+        self.assertEqual(tuple(self.store.db.execute('SELECT ord,line,qty,source_id FROM cpa').fetchone()), ('200', 'B', 30, '00999'))
+        self.assertTrue(sheet.formulas[0][0].startswith('=IMPORTRANGE'))
+        self.assertEqual(sheet.values[1][0], '200')
+
     def test_blank_config_checkboxes_not_lasers(self):
         rows = [CONFIG_HEADERS, ['L1', 'Uno', 'Uno', 1, True], ['', '', '', '', False]]
         _, lasers = parse_directory([['APELLIDOS_NOMBRES', 'CODIGO_EMPLEADO']], rows)
         self.assertEqual(len(lasers), 1)
+

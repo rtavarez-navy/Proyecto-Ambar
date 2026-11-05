@@ -383,9 +383,12 @@ class Desktop(tk.Tk):
         name = simpledialog.askstring('Láser', 'Nombre de la láser:', initialvalue=laser['name'] if laser else '', parent=self)
         if not name:
             return
-        account = simpledialog.askstring('Cuenta CPA', 'Cuenta CPA de referencia (sin contraseña):', initialvalue=laser['cpa_account'] if laser else '', parent=self)
+        account = simpledialog.askstring('Cuenta CPA', 'Correo de la cuenta CPA:', initialvalue=laser['cpa_account'] if laser else '', parent=self)
         if account is not None:
-            self.job(lambda: self.api.call('/laser', name=name, account=account, laser_id=laser['id'] if laser else None), lambda _: self.refresh())
+            password = simpledialog.askstring('Cuenta CPA', 'Contraseña CPA (se guardará en el Sheet):', show='•', initialvalue=laser.get('cpa_password', '') if laser else '', parent=self)
+            if password is None:
+                return
+            self.job(lambda: self.api.call('/laser', name=name, account=account, laser_id=laser['id'] if laser else None, cpa_password=password), lambda _: self.refresh())
 
     def import_cpa(self):
         path = filedialog.askopenfilename(title='Base CPA de Hermes', filetypes=[('Base CPA', '*.db *.sqlite *.sqlite3 *.csv *.xlsx')])
@@ -510,3 +513,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

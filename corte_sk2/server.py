@@ -56,7 +56,7 @@ class App:
             if path == '/employee':
                 self.store.add_employee(actor, data.get('code'), data.get('name'))
             elif path == '/laser':
-                self.store.save_laser(actor, data.get('name'), data.get('account', ''), data.get('laser_id'))
+                self.store.save_laser(actor, data.get('name'), data.get('account', ''), data.get('laser_id'), data.get('cpa_password'))
             elif path == '/laser-active':
                 self.store.set_laser_active(actor, data.get('laser_id'), data.get('active', True))
             elif path == '/assign':
@@ -181,3 +181,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

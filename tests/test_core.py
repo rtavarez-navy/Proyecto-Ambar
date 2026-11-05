@@ -61,6 +61,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(rows[0]['laser_id'], 1)
         self.assertEqual(self.store.snapshot('100')['employees'], [])
         self.assertNotIn('cpa_account', self.store.snapshot('100')['lasers'][0])
+        self.assertNotIn('cpa_password', self.store.snapshot('100')['lasers'][0])
         with self.assertRaises(ValueError):
             self.store.assign('100', '200', 1)
 
@@ -125,6 +126,15 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Demasiados'):
             app.call('/login', {'code': '100', 'password': 'personal123'}, ip='station')
 
+    def test_id_conflicts_are_rejected_and_missing_id_stays_blank(self):
+        self.store.import_cpa('SUP', [{'Order': '1', 'Set': 'A', 'Qty': 3, 'ID': '00042'}])
+        self.assertEqual(self.store.db.execute('SELECT source_id FROM cpa').fetchone()[0], '00042')
+        with self.assertRaises(ValueError):
+            self.store.import_cpa('SUP', [{'Order': '1', 'Set': 'A', 'Qty': 3, 'ID': '42'}, {'Order': '1', 'Set': 'A', 'Qty': 3, 'ID': '43'}])
+        self.assertEqual(self.store.db.execute('SELECT source_id FROM cpa').fetchone()[0], '00042')
+        self.store.import_cpa('SUP', [{'Order': '1', 'Set': 'A', 'Qty': 3}])
+        self.assertEqual(self.store.db.execute('SELECT source_id FROM cpa').fetchone()[0], '')
+
     def test_manual_date_separate_from_registration_time(self):
         self.report(report_date='2027-01-02')
         row = self.store.snapshot('100')['reports'][0]
@@ -149,3 +159,4 @@ class WorkflowTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

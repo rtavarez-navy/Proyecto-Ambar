@@ -14,7 +14,7 @@ def read_cpa(filename):
             qty = 'Prod Line Pieces #' if 'Prod Line Pieces #' in cols else 'Qty'
             if not {'Order', 'Set', qty} <= cols:
                 raise ValueError('cpa_lines debe contener Order, Set y Prod Line Pieces # o Qty.')
-            quantities = [name for name in ('Prod Line Pieces #', 'Qty') if name in cols]
+            quantities = [name for name in ('Prod Line Pieces #', 'Qty', 'ID') if name in cols]
             query = 'SELECT "Order", "Set", ' + ', '.join(chr(34) + name + chr(34) for name in quantities) + ' FROM "cpa_lines"'
             return [dict(row) for row in db.execute(query)]
     if suffix == '.xlsx':
@@ -40,3 +40,4 @@ def read_cpa(filename):
                 dialect = csv.excel
             return [dict(row) for row in csv.DictReader(stream, dialect=dialect)]
     raise ValueError('Selecciona un archivo CPA .db, .csv o .xlsx.')
+

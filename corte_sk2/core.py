@@ -50,7 +50,7 @@ def pieces(value):
         raise ValueError('Cantidad de piezas inválida.') from None
 
 
-def normalize_cpa(rows):
+def normalize_cpa(rows, include_ids=False):
     result = {}
     for index, row in enumerate(rows, 2):
         order = identifier(row.get('Order', row.get('Orden', '')))
@@ -64,12 +64,16 @@ def normalize_cpa(rows):
             raise ValueError(f'Fila {index}: se requieren Order, Set y Prod Line Pieces # o Qty.')
         qty = pieces(raw)
         key = (order, line)
-        if key in result and result[key] != qty:
-            raise ValueError(f'CPA ambiguo: {order}|{line} tiene cantidades distintas.')
-        result[key] = qty
+        source_id = identifier(row.get('ID', ''))
+        if key in result:
+            old_qty, old_id = result[key]
+            if old_qty != qty or (old_id and source_id and old_id != source_id):
+                raise ValueError(f'CPA ambiguo: {order}|{line} tiene cantidades o IDs distintos.')
+            source_id = source_id or old_id
+        result[key] = (qty, source_id)
     if not result:
         raise ValueError('La base CPA no contiene líneas válidas. No se reemplazó la base anterior.')
-    return [(order, line, qty) for (order, line), qty in result.items()]
+    return [(order, line, qty, source_id) if include_ids else (order, line, qty) for (order, line), (qty, source_id) in result.items()]
 
 
 class Store:
@@ -96,6 +100,10 @@ class Store:
             self.db.execute('UPDATE lasers SET external_id=?, sheet_title=?, sort_order=? WHERE id=?', (f'LASER_{row[0]:02d}', f'Láser {row[0]:02d}', row[0], row[0]))
         if 'report_date' not in {r[1] for r in self.db.execute('PRAGMA table_info(reports)')}:
             self.db.execute("ALTER TABLE reports ADD COLUMN report_date TEXT NOT NULL DEFAULT ''")
+        if 'cpa_password' not in {r[1] for r in self.db.execute('PRAGMA table_info(lasers)')}:
+            self.db.execute("ALTER TABLE lasers ADD COLUMN cpa_password TEXT NOT NULL DEFAULT ''")
+        if 'source_id' not in {r[1] for r in self.db.execute('PRAGMA table_info(cpa)')}:
+            self.db.execute("ALTER TABLE cpa ADD COLUMN source_id TEXT NOT NULL DEFAULT ''")
         self.db.commit()
 
     def _audit(self, actor, action, detail):
@@ -154,20 +162,28 @@ class Store:
             self.db.execute('INSERT INTO users VALUES(?,?,?,?,1,NULL)', (code, name, password_hash(DEFAULT_PASSWORD), 'operator'))
             self._audit(actor, 'EMPLEADO', code)
 
-    def save_laser(self, actor, name, account='', laser_id=None):
+    def save_laser(self, actor, name, account='', laser_id=None, cpa_password=None):
         with self.lock, self.db:
             self.supervisor(actor)
             name = text(name)
             if not name or len(name) > 60:
                 raise ValueError('Nombre de láser requerido (máximo 60 caracteres).')
+            previous = self.db.execute('SELECT cpa_account,cpa_password FROM lasers WHERE id=?', (laser_id,)).fetchone() if laser_id is not None else None
             if laser_id is None:
                 cur = self.db.execute('INSERT INTO lasers(name,cpa_account) VALUES(?,?)', (name, text(account)))
-                lid = cur.lastrowid
+                laser_id = lid = cur.lastrowid
                 self.db.execute('UPDATE lasers SET external_id=?,sheet_title=?,sort_order=? WHERE id=?', (f'LASER_{lid:02d}', f'Láser {lid:02d}', lid, lid))
             else:
                 if not self.db.execute('SELECT 1 FROM lasers WHERE id=?', (laser_id,)).fetchone():
                     raise ValueError('Láser inexistente.')
                 self.db.execute('UPDATE lasers SET name=?,cpa_account=? WHERE id=?', (name, text(account), laser_id))
+            if cpa_password is not None:
+                self.db.execute('UPDATE lasers SET cpa_password=? WHERE id=?', (str(cpa_password), laser_id))
+            if previous is None or previous['cpa_account'] != text(account) or (cpa_password is not None and previous['cpa_password'] != str(cpa_password)):
+                saved = self.db.execute("SELECT value FROM meta WHERE key='cpa_credentials_pending'").fetchone()
+                pending = set(json.loads(saved[0])) if saved else set()
+                pending.add(self.db.execute('SELECT external_id FROM lasers WHERE id=?', (laser_id,)).fetchone()[0])
+                self.db.execute("INSERT INTO meta VALUES('cpa_credentials_pending',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(sorted(pending)),))
             self.db.execute("INSERT INTO meta VALUES('config_dirty','1') ON CONFLICT(key) DO UPDATE SET value='1'")
             self._audit(actor, 'LASER', name)
 
@@ -231,14 +247,26 @@ class Store:
             self._audit(actor, 'ASIGNACION', f'{code} -> {laser_id}')
 
     def import_cpa(self, actor, rows):
-        data = normalize_cpa(rows)
+        data = normalize_cpa(rows, include_ids=True)
         with self.lock, self.db:
             self.supervisor(actor)
             self.db.execute('DELETE FROM cpa')
-            self.db.executemany('INSERT INTO cpa VALUES(?,?,?)', data)
+            self.db.executemany('INSERT INTO cpa(ord,line,qty,source_id) VALUES(?,?,?,?)', data)
             self.db.execute("INSERT INTO meta VALUES('cpa_updated',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (stamp(),))
             self._audit(actor, 'CPA', f'{len(data)} líneas importadas')
         return len(data)
+
+    def import_cpa_sheet(self, rows):
+        data = sorted(normalize_cpa(rows, include_ids=True))
+        with self.lock, self.db:
+            existing = sorted(tuple(r) for r in self.db.execute('SELECT ord,line,qty,source_id FROM cpa'))
+            if data == existing:
+                return False
+            self.db.execute('DELETE FROM cpa')
+            self.db.executemany('INSERT INTO cpa(ord,line,qty,source_id) VALUES(?,?,?,?)', data)
+            self.db.execute("INSERT INTO meta VALUES('cpa_updated',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (stamp(),))
+            self._audit('sistema', 'CPA_SHEETS', f'{len(data)} líneas importadas')
+            return True
 
     def report(self, actor, request_id, order, line, qty, comment='', reprint=False, laser_id=None, report_date=None):
         order, line = identifier(order), identifier(line).upper()
@@ -313,3 +341,4 @@ class Store:
                     'today': stamp()[:10], 'cpa_lines': len(cpa),
                     'cpa_updated': meta.get('cpa_updated', 'Sin cargar'),
                     'sync': {k: meta.get(k, '') for k in ('dirty', 'sync_at', 'sync_error')}}
+
