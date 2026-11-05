@@ -11,7 +11,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from .core import Store
-from .sheets import SheetsSync
+from .sheets import SheetsSync, SPREADSHEET_ID
 
 MAX_BODY = 64 * 1024 * 1024
 
@@ -57,12 +57,14 @@ class App:
                 self.store.add_employee(actor, data.get('code'), data.get('name'))
             elif path == '/laser':
                 self.store.save_laser(actor, data.get('name'), data.get('account', ''), data.get('laser_id'))
+            elif path == '/laser-active':
+                self.store.set_laser_active(actor, data.get('laser_id'), data.get('active', True))
             elif path == '/assign':
                 self.store.assign(actor, data.get('code'), data.get('laser_id'))
             elif path == '/cpa':
                 return {'count': self.store.import_cpa(actor, data.get('rows', []))}
             elif path == '/report':
-                return {'id': self.store.report(actor, data.get('request_id'), data.get('order'), data.get('line'), data.get('qty'), data.get('comment', ''), data.get('reprint', False), data.get('laser_id'))}
+                return {'id': self.store.report(actor, data.get('request_id'), data.get('order'), data.get('line'), data.get('qty'), data.get('comment', ''), data.get('reprint', False), data.get('laser_id'), data.get('report_date'))}
             elif path == '/sync':
                 self.store.supervisor(actor)
                 if not self.sync:
@@ -112,15 +114,43 @@ def main():
     parser = argparse.ArgumentParser(description='Servidor central Corte SK2 2027')
     parser.add_argument('--config', default='server.json')
     parser.add_argument('--restore-sheet', action='store_true')
+    parser.add_argument('--connect-google', action='store_true', help='Configurar credencial local y comprobar el Sheet')
     args = parser.parse_args()
     config_path = Path(args.config).resolve()
     if not config_path.exists():
         print('Primera configuración del servicio central.')
-        config = {'host': '0.0.0.0', 'port': 8765, 'database': 'datos/corte.db', 'spreadsheet_id': '', 'credentials': 'google-service-account.json'}
+        config = {'host': '0.0.0.0', 'port': 8765, 'database': 'datos/corte.db', 'spreadsheet_id': SPREADSHEET_ID, 'credentials': 'google-service-account.json'}
         config_path.write_text(json.dumps(config, indent=2), encoding='utf-8')
     config = json.loads(config_path.read_text(encoding='utf-8'))
     def local_path(value):
         return config_path.parent / value
+    if args.connect_google:
+        import shutil
+        print('La credencial se guarda solo en este equipo; no la subas a GitHub ni al chat.')
+        source = Path(input('Ruta al JSON de la cuenta de servicio de Google: ').strip().strip(chr(34)))
+        credential = json.loads(source.read_text(encoding='utf-8'))
+        if credential.get('type') != 'service_account' or not credential.get('client_email'):
+            raise ValueError('Selecciona el JSON original de una cuenta de servicio.')
+        spreadsheet = config.get('spreadsheet_id') or input('Enlace o ID del Google Sheet de corte: ').strip()
+        if '/spreadsheets/d/' in spreadsheet:
+            spreadsheet = spreadsheet.split('/spreadsheets/d/', 1)[1].split('/', 1)[0].split('?', 1)[0]
+        import re
+        if not re.fullmatch(r'[A-Za-z0-9_-]{20,}', spreadsheet):
+            raise ValueError('El enlace o ID del Sheet no es válido.')
+        config['spreadsheet_id'] = spreadsheet
+        destination = local_path(config['credentials'])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != destination.resolve():
+            shutil.copyfile(source, destination)
+        print('Comparte el Sheet como EDITOR con: ' + credential['client_email'])
+        input('Cuando esté compartido, pulsa Enter para comprobar la conexión: ')
+        import gspread
+        book = gspread.service_account(filename=str(destination)).open_by_key(config['spreadsheet_id'])
+        titles = {w.title for w in book.worksheets()}
+        if not {'Maestro', 'Configuración', 'Consolidado'} <= titles:
+            raise ValueError('El archivo no contiene la estructura esperada de Corte SK2.')
+        config_path.write_text(json.dumps(config, indent=2), encoding='utf-8')
+        print('Conexión comprobada: ' + book.title)
     database = local_path(config['database'])
     database.parent.mkdir(parents=True, exist_ok=True)
     store = Store(database)

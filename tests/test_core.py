@@ -125,6 +125,14 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Demasiados'):
             app.call('/login', {'code': '100', 'password': 'personal123'}, ip='station')
 
+    def test_manual_date_separate_from_registration_time(self):
+        self.report(report_date='2027-01-02')
+        row = self.store.snapshot('100')['reports'][0]
+        self.assertEqual(row['report_date'], '2027-01-02')
+        self.assertNotEqual(row['created'][:10], row['report_date'])
+        with self.assertRaises(ValueError):
+            self.report(key='invalid', report_date='02/01/2027')
+
     def test_persistence_and_csv_import(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'state.db'

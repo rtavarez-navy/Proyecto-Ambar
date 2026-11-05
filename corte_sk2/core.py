@@ -7,7 +7,7 @@ import json
 import secrets
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -88,6 +88,14 @@ class Store:
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, created TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
         ''')
+        columns = {r[1] for r in self.db.execute('PRAGMA table_info(lasers)')}
+        for name, definition in [('external_id', "TEXT NOT NULL DEFAULT ''"), ('sheet_title', "TEXT NOT NULL DEFAULT ''"), ('active', 'INTEGER NOT NULL DEFAULT 1'), ('sort_order', 'INTEGER NOT NULL DEFAULT 0')]:
+            if name not in columns:
+                self.db.execute(f'ALTER TABLE lasers ADD COLUMN {name} {definition}')
+        for row in self.db.execute("SELECT id FROM lasers WHERE external_id=''").fetchall():
+            self.db.execute('UPDATE lasers SET external_id=?, sheet_title=?, sort_order=? WHERE id=?', (f'LASER_{row[0]:02d}', f'Láser {row[0]:02d}', row[0], row[0]))
+        if 'report_date' not in {r[1] for r in self.db.execute('PRAGMA table_info(reports)')}:
+            self.db.execute("ALTER TABLE reports ADD COLUMN report_date TEXT NOT NULL DEFAULT ''")
         self.db.commit()
 
     def _audit(self, actor, action, detail):
@@ -153,18 +161,69 @@ class Store:
             if not name or len(name) > 60:
                 raise ValueError('Nombre de láser requerido (máximo 60 caracteres).')
             if laser_id is None:
-                self.db.execute('INSERT INTO lasers(name,cpa_account) VALUES(?,?)', (name, text(account)))
+                cur = self.db.execute('INSERT INTO lasers(name,cpa_account) VALUES(?,?)', (name, text(account)))
+                lid = cur.lastrowid
+                self.db.execute('UPDATE lasers SET external_id=?,sheet_title=?,sort_order=? WHERE id=?', (f'LASER_{lid:02d}', f'Láser {lid:02d}', lid, lid))
             else:
                 if not self.db.execute('SELECT 1 FROM lasers WHERE id=?', (laser_id,)).fetchone():
                     raise ValueError('Láser inexistente.')
                 self.db.execute('UPDATE lasers SET name=?,cpa_account=? WHERE id=?', (name, text(account), laser_id))
+            self.db.execute("INSERT INTO meta VALUES('config_dirty','1') ON CONFLICT(key) DO UPDATE SET value='1'")
             self._audit(actor, 'LASER', name)
+
+    def set_laser_active(self, actor, laser_id, active):
+        with self.lock, self.db:
+            self.supervisor(actor)
+            row = self.db.execute('SELECT name FROM lasers WHERE id=?', (laser_id,)).fetchone()
+            if not row:
+                raise ValueError('Láser inexistente.')
+            self.db.execute('UPDATE lasers SET active=? WHERE id=?', (int(bool(active)), laser_id))
+            if not active:
+                self.db.execute('UPDATE users SET laser_id=NULL WHERE laser_id=?', (laser_id,))
+            self.db.execute("INSERT INTO meta VALUES('config_dirty','1') ON CONFLICT(key) DO UPDATE SET value='1'")
+            self._audit(actor, 'LASER_ACTIVA', f'{laser_id}: {bool(active)}')
+
+    def import_directory(self, employees, lasers):
+        """Entradas de Sheets; nunca sobrescribe claves, roles ni historial."""
+        with self.lock, self.db:
+            changed = 0
+            keys = {r['external_id'] for r in lasers}
+            for item in lasers:
+                old = self.db.execute('SELECT * FROM lasers WHERE external_id=?', (item['external_id'],)).fetchone()
+                values = (item['name'], item['sheet_title'], item['active'], item['sort_order'])
+                if old:
+                    if tuple(old[k] for k in ('name', 'sheet_title', 'active', 'sort_order')) != values:
+                        self.db.execute('UPDATE lasers SET name=?,sheet_title=?,active=?,sort_order=? WHERE id=?', values + (old['id'],))
+                        changed += 1
+                    lid = old['id']
+                else:
+                    lid = self.db.execute('INSERT INTO lasers(name,sheet_title,active,sort_order,external_id) VALUES(?,?,?,?,?)', values + (item['external_id'],)).lastrowid
+                    changed += 1
+                if not item['active']:
+                    self.db.execute('UPDATE users SET laser_id=NULL WHERE laser_id=?', (lid,))
+            # Quitar del catálogo significa desactivar, nunca borrar producción.
+            for row in self.db.execute('SELECT id,external_id FROM lasers WHERE active=1').fetchall():
+                if row['external_id'] not in keys:
+                    self.db.execute('UPDATE lasers SET active=0 WHERE id=?', (row['id'],))
+                    self.db.execute('UPDATE users SET laser_id=NULL WHERE laser_id=?', (row['id'],))
+                    changed += 1
+            for code, name in employees:
+                old = self.db.execute('SELECT name,role FROM users WHERE code=?', (code,)).fetchone()
+                if old is None:
+                    self.db.execute('INSERT INTO users VALUES(?,?,?,?,1,NULL)', (code, name, password_hash(DEFAULT_PASSWORD), 'operator'))
+                    changed += 1
+                elif old['role'] == 'operator' and old['name'] != name:
+                    self.db.execute('UPDATE users SET name=? WHERE code=?', (name, code))
+                    changed += 1
+            if changed:
+                self._audit('sistema', 'DIRECTORIO_SHEETS', f'{changed} cambios')
+            return changed
 
     def assign(self, actor, code, laser_id):
         with self.lock, self.db:
             self.supervisor(actor)
-            if laser_id is not None and not self.db.execute('SELECT 1 FROM lasers WHERE id=?', (laser_id,)).fetchone():
-                raise ValueError('Láser inexistente.')
+            if laser_id is not None and not self.db.execute('SELECT 1 FROM lasers WHERE id=? AND active=1', (laser_id,)).fetchone():
+                raise ValueError('Láser inexistente o desactivada.')
             row = self.db.execute('SELECT role FROM users WHERE code=?', (code,)).fetchone()
             if not row or row['role'] != 'operator':
                 raise ValueError('Selecciona un operador válido.')
@@ -181,9 +240,14 @@ class Store:
             self._audit(actor, 'CPA', f'{len(data)} líneas importadas')
         return len(data)
 
-    def report(self, actor, request_id, order, line, qty, comment='', reprint=False, laser_id=None):
+    def report(self, actor, request_id, order, line, qty, comment='', reprint=False, laser_id=None, report_date=None):
         order, line = identifier(order), identifier(line).upper()
         qty = pieces(qty)
+        report_date = text(report_date) or stamp()[:10]
+        try:
+            date.fromisoformat(report_date)
+        except ValueError:
+            raise ValueError('Fecha inválida. Usa AAAA-MM-DD.') from None
         if not order or not line or qty <= 0 or not request_id:
             raise ValueError('Completa orden, línea y una cantidad de piezas mayor a cero.')
         if len(order) > 60 or len(line) > 20 or len(comment) > 2000:
@@ -196,14 +260,15 @@ class Store:
                 laser_id = user['laser_id']  # Nunca confiar en la láser enviada por el cliente.
             if laser_id is None:
                 raise ValueError('Esperando a ser asignado. Habla con tu supervisor.')
-            if not self.db.execute('SELECT 1 FROM lasers WHERE id=?', (laser_id,)).fetchone():
-                raise ValueError('Selecciona una láser válida.')
+            if not self.db.execute('SELECT 1 FROM lasers WHERE id=? AND active=1', (laser_id,)).fetchone():
+                raise ValueError('Selecciona una láser activa válida.')
             existing = self.db.execute('SELECT id,employee FROM reports WHERE request_id=?', (request_id,)).fetchone()
             if existing:
                 if existing['employee'] != actor:
                     raise ValueError('Identificador de envío inválido.')
                 return existing['id']
             cur = self.db.execute('INSERT INTO reports(request_id,created,employee,laser_id,ord,line,qty,comment,reprint) VALUES(?,?,?,?,?,?,?,?,?)', (request_id, stamp(), actor, laser_id, order, line, qty, text(comment), int(bool(reprint))))
+            self.db.execute('UPDATE reports SET report_date=? WHERE id=?', (report_date, cur.lastrowid))
             self._audit(actor, 'REPORTE', f'{cur.lastrowid}: {order}|{line} ({qty})')
             return cur.lastrowid
 
@@ -218,6 +283,7 @@ class Store:
             for row in all_reports:
                 grouped.setdefault((row['ord'], row['line']), []).append(row)
             for row in all_reports:
+                row['report_date'] = row.get('report_date') or row['created'][:10]
                 key = row['ord'], row['line']
                 group = grouped[key]
                 messages = []
@@ -238,9 +304,9 @@ class Store:
                 row['alert'] = ' | '.join(messages)
             is_supervisor = user['role'] == 'supervisor'
             visible = all_reports if is_supervisor else [r for r in all_reports if r['laser_id'] == user['laser_id']]
-            lasers = [dict(r) for r in self.db.execute('SELECT * FROM lasers ORDER BY id')]
+            lasers = [dict(r) for r in self.db.execute('SELECT * FROM lasers ORDER BY sort_order,id')]
             if not is_supervisor:
-                lasers = [{k: r[k] for k in ('id', 'name')} for r in lasers if r['id'] == user['laser_id']]
+                lasers = [{k: r[k] for k in ('id', 'name')} for r in lasers if r['id'] == user['laser_id'] and r['active']]
             meta = dict(self.db.execute('SELECT key,value FROM meta'))
             return {'user': user, 'reports': visible, 'lasers': lasers,
                     'employees': [self.public_user(r) for r in self.db.execute("SELECT * FROM users WHERE role='operator' ORDER BY code")] if is_supervisor else [],

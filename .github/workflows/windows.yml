@@ -26,5 +26,6 @@ jobs:
           path: |
             dist/*.exe
             server.example.json
+            *.cmd
             README.md
           retention-days: 30

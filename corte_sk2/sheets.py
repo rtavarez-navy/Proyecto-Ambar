@@ -1,25 +1,74 @@
-"""Proyección recuperable de datos a Google Sheets. Solo se ejecuta en el servidor."""
+"""Directorio de entrada y proyección recuperable al Sheet de Corte SK2."""
 import json
+import re
 import threading
 import time
-from .core import stamp
+from .core import identifier, stamp, text
 
 TABLES = ('lasers', 'users', 'cpa', 'reports', 'audit')
+SPREADSHEET_ID = ''
+HEADERS = ['FECHA', '# DE ORDEN', 'LINEA', '# PIEZAS', 'COMENTARIOS', 'LASER_ID', 'CODIGO_EMPLEADO', 'NOMBRE_OPERADOR', 'HORA_REGISTRO', 'ID_REGISTRO', 'VALIDACION', 'ALERTA', 'REPRINT']
+CONFIG_HEADERS = ['LASER_ID', 'NOMBRE', 'HOJA', 'ORDEN', 'ACTIVO']
+RESERVED = {'Maestro', 'Configuración', 'Consolidado', 'Kyoodo', 'Asignaciones', 'Cuentas CPA', 'CPA DATA', '_Estado'}
 
 
 def tab_name(laser):
-    # El id estable evita colisiones y títulos inválidos de Sheets.
-    return f"Laser {laser['id']}"
+    return laser.get('sheet_title') or f"Láser {laser['id']:02d}"
+
+
+def parse_directory(master, config):
+    if not master or not {'APELLIDOS_NOMBRES', 'CODIGO_EMPLEADO'} <= set(master[0]):
+        raise ValueError('Maestro requiere APELLIDOS_NOMBRES y CODIGO_EMPLEADO.')
+    name_col, code_col = master[0].index('APELLIDOS_NOMBRES'), master[0].index('CODIGO_EMPLEADO')
+    employees = {}
+    for index, row in enumerate(master[1:], 2):
+        if not any(text(v) for v in row):
+            continue
+        row = list(row) + [''] * len(master[0])
+        code, name = identifier(row[code_col]), text(row[name_col])
+        if not code or not name:
+            raise ValueError(f'Maestro fila {index}: código y nombre requeridos.')
+        if code in employees and employees[code] != name:
+            raise ValueError(f'Maestro: código duplicado con nombres diferentes ({code}).')
+        employees[code] = name
+    if not config or config[0][:5] != CONFIG_HEADERS:
+        raise ValueError('Configuración requiere LASER_ID, NOMBRE, HOJA, ORDEN, ACTIVO.')
+    lasers, keys, titles, names = [], set(), set(), set()
+    for index, row in enumerate(config[1:], 2):
+        row = list(row) + [''] * 5
+        key, name, title, order, active = row[:5]
+        if not any(text(v) for v in (key, name, title, order)):
+            continue  # Filas vacías con checkbox FALSE no son láseres.
+        key, name, title = text(key), text(name), text(title)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,50}', key):
+            raise ValueError(f'Configuración fila {index}: LASER_ID inválido.')
+        if not name or len(name) > 60 or not title or len(title) > 100 or re.search(r'[\[\]:*?/\\]', title) or title in RESERVED:
+            raise ValueError(f'Configuración fila {index}: nombre u hoja no válidos.')
+        if key in keys or title in titles or name in names:
+            raise ValueError('Configuración contiene id, nombre u hoja duplicados.')
+        truth = text(active).lower()
+        if truth not in ('true', 'false', '1', '0', 'verdadero', 'falso'):
+            raise ValueError(f'Configuración fila {index}: ACTIVO debe ser una casilla TRUE/FALSE.')
+        try:
+            position = int(order)
+        except (ValueError, TypeError):
+            raise ValueError(f'Configuración fila {index}: ORDEN debe ser entero.') from None
+        lasers.append({'external_id': key, 'name': name, 'sheet_title': title, 'sort_order': position, 'active': int(truth in ('true', '1', 'verdadero'))})
+        keys.add(key); titles.add(title); names.add(name)
+    if not lasers:
+        raise ValueError('Configuración no tiene láseres. No se alteró el catálogo local.')
+    return list(employees.items()), lasers
 
 
 class SheetsSync:
     def __init__(self, store, spreadsheet_id, credentials):
-        self.store = store
-        self.spreadsheet_id = spreadsheet_id
-        self.credentials = credentials
+        self.store, self.spreadsheet_id, self.credentials = store, spreadsheet_id, credentials
         self.guard = threading.Lock()
 
     def book(self):
+        from pathlib import Path
+        if not Path(self.credentials).is_file():
+            raise ValueError('Falta google-service-account.json. Ejecuta el servidor con --connect-google.')
         import gspread
         return gspread.service_account(filename=self.credentials).open_by_key(self.spreadsheet_id)
 
@@ -29,15 +78,53 @@ class SheetsSync:
         try:
             self._sync()
         except Exception as exc:
+            if isinstance(exc, ValueError):
+                detail = str(exc)
+            else:
+                detail = f'{type(exc).__name__}: no se pudo sincronizar. Comprueba credenciales, permisos del Sheet y conexión.'
             with self.store.lock, self.store.db:
-                self.store.db.execute("INSERT INTO meta VALUES('sync_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f'{type(exc).__name__}: no se pudo sincronizar con Google Sheets.',))
+                self.store.db.execute("INSERT INTO meta VALUES('sync_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (detail,))
         finally:
             self.guard.release()
 
     def _sync(self):
-        s = self.store
+        s, book = self.store, self.book()
+        worksheets = {w.title: w for w in book.worksheets()}
+        if 'Maestro' not in worksheets or 'Configuración' not in worksheets:
+            raise ValueError('No se encontraron Maestro y Configuración en el Sheet.')
+        master = worksheets['Maestro'].get_all_values()
         with s.lock:
+            meta = dict(s.db.execute('SELECT key,value FROM meta'))
+            config_dirty = meta.get('config_dirty') == '1'
+            if config_dirty:
+                config = [CONFIG_HEADERS] + [[r['external_id'], r['name'], tab_name(dict(r)), r['sort_order'], bool(r['active'])] for r in s.db.execute('SELECT * FROM lasers ORDER BY sort_order,id')]
+            else:
+                config = worksheets['Configuración'].get_all_values()
+            employees, lasers = parse_directory(master, config)
+            s.import_directory(employees, lasers)
+            if not config_dirty and 'Cuentas CPA' in worksheets:
+                accounts = worksheets['Cuentas CPA'].get_all_values()
+                if accounts and accounts[0][:3] != ['LASER_ID', 'LASER', 'CUENTA_CPA']:
+                    raise ValueError('Cuentas CPA requiere LASER_ID, LASER, CUENTA_CPA.')
+                with s.db:
+                    seen = set()
+                    for row in accounts[1:]:
+                        row = list(row) + [''] * 3
+                        key, account = text(row[0]), text(row[2])
+                        if not key:
+                            continue
+                        if key in seen:
+                            raise ValueError('Cuentas CPA contiene un LASER_ID duplicado.')
+                        seen.add(key)
+                        old = s.db.execute('SELECT id,cpa_account FROM lasers WHERE external_id=?', (key,)).fetchone()
+                        if old is None:
+                            raise ValueError('Cuentas CPA contiene un LASER_ID que no existe en Configuración.')
+                        if old['cpa_account'] != account:
+                            s.db.execute('UPDATE lasers SET cpa_account=? WHERE id=?', (account, old['id']))
+                            s._audit('sistema', 'CUENTA_CPA_SHEETS', key)
             if not s.db.execute("SELECT 1 FROM meta WHERE key='dirty' AND value='1'").fetchone():
+                with s.db:
+                    s.db.execute("INSERT INTO meta VALUES('sync_error','') ON CONFLICT(key) DO UPDATE SET value=''")
                 return
             supervisor = s.db.execute("SELECT code FROM users WHERE role='supervisor' AND must_change=0 LIMIT 1").fetchone()
             if not supervisor:
@@ -45,52 +132,80 @@ class SheetsSync:
             snapshot = s.snapshot(supervisor[0])
             tables = {table: [dict(r) for r in s.db.execute(f'SELECT * FROM {table}')] for table in TABLES}
             revision = s.db.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0]
-        book = self.book()
-        worksheets = {w.title: w for w in book.worksheets()}
+        # No sobrescribir reportes manuales o de otra base local.
+        if 'Consolidado' in worksheets:
+            existing = worksheets['Consolidado'].get_all_values()
+            known = {r['request_id'] for r in tables['reports']}
+            for row in existing[1:]:
+                if any(text(v) for v in row):
+                    if len(row) < 10 or text(row[9]) not in known:
+                        raise ValueError('Consolidado contiene registros ajenos a esta base local. Recupera el respaldo con --restore-sheet; no se sobrescribió producción.')
+        batches, requests = [], []
 
-        def write(title, values, colors=None):
+        def write(title, values):
             ws = worksheets.get(title)
             if ws is None:
-                ws = book.add_worksheet(title, rows=max(100, len(values)), cols=max(12, len(values[0])))
+                ws = book.add_worksheet(title, rows=max(1000, len(values)), cols=max(13, len(values[0])))
                 worksheets[title] = ws
-            target_rows, target_cols = max(2, len(values)), max(1, len(values[0]))
-            if ws.row_count != target_rows or ws.col_count != target_cols:
-                ws.resize(rows=target_rows, cols=target_cols)
-            # RAW impide interpretar comentarios como fórmulas.
-            ws.update(values=values, range_name='A1', value_input_option='RAW')
-            if colors is not None:
-                requests = [{'repeatCell': {'range': {'sheetId': ws.id, 'startRowIndex': 1}, 'cell': {'userEnteredFormat': {'backgroundColor': {'red': 0.04, 'green': 0.08, 'blue': 0.06}}}, 'fields': 'userEnteredFormat.backgroundColor'}}]
-                for i, color in enumerate(colors, 1):
-                    if color:
-                        rgb = {'red': 0.8, 'green': 0.2, 'blue': 0.2} if color == 'red' else {'red': 1, 'green': 0.85, 'blue': 0.25}
-                        requests.append({'repeatCell': {'range': {'sheetId': ws.id, 'startRowIndex': i, 'endRowIndex': i + 1}, 'cell': {'userEnteredFormat': {'backgroundColor': rgb}}, 'fields': 'userEnteredFormat.backgroundColor'}})
-                book.batch_update({'requests': requests})
+            rows, cols = max(ws.row_count, len(values), 2), max(ws.col_count, len(values[0]))
+            if ws.row_count < rows or ws.col_count < cols:
+                ws.resize(rows=rows, cols=cols)
+            quoted = "'" + title.replace("'", "''") + "'"
+            batches.append({'range': f'{quoted}!A1', 'values': values})
+            # Limpiar solo valores obsoletos de la proyección, preservando formato y validación.
+            if len(values) < ws.row_count:
+                requests.append({'repeatCell': {'range': {'sheetId': ws.id, 'startRowIndex': len(values), 'endRowIndex': ws.row_count, 'startColumnIndex': 0, 'endColumnIndex': len(values[0])}, 'cell': {}, 'fields': 'userEnteredValue'}})
             if ws.frozen_row_count != 1:
                 ws.freeze(rows=1)
+            return ws
 
+        names = {r['code']: r['name'] for r in tables['users']}
+        laser_map = {r['id']: r for r in snapshot['lasers']}
+        rows = snapshot['reports']
+        data = [HEADERS] + [[r['report_date'], r['ord'], r['line'], r['qty'], r['comment'], laser_map[r['laser_id']]['external_id'], r['employee'], names[r['employee']], r['created'], r['request_id'], r['alert'], r['color'], bool(r['reprint'])] for r in rows]
+        consolidated = write('Consolidado', data)
+        # Las hojas individuales son vistas del consolidado, no copias que puedan divergir.
         for laser in snapshot['lasers']:
-            rows = [r for r in snapshot['reports'] if r['laser_id'] == laser['id']]
-            values = [['Fecha y hora', 'Orden', 'Línea', 'Piezas', 'Comentarios', 'Reprint', 'Empleado', 'Láser', 'Validación', 'ID']]
-            values += [[r['created'], r['ord'], r['line'], r['qty'], r['comment'], r['reprint'], r['employee'], r['laser'], r['alert'], r['id']] for r in rows]
-            write(tab_name(laser), values, [r['color'] for r in rows])
-        rows = sorted(snapshot['reports'], key=lambda r: (int(r['ord']) if r['ord'].isdigit() else -1, r['ord'], r['id']), reverse=True)
-        write('Kyoodo', [['Orden', 'Láser', 'Secuencia', 'Comentario', 'Línea', 'ID']] + [[r['ord'], r['laser'], i, ' | '.join(filter(None, [r['comment'], r['alert']])), r['line'], r['id']] for i, r in enumerate(rows, 1)])
-        names = {r['id']: r['name'] for r in snapshot['lasers']}
-        write('Asignaciones', [['Código', 'Nombre', 'Láser']] + [[r['code'], r['name'], names.get(r['laser_id'], '')] for r in snapshot['employees']])
-        write('Cuentas CPA', [['Láser', 'Cuenta CPA']] + [[r['name'], r['cpa_account']] for r in snapshot['lasers']])
+            title = tab_name(laser)
+            ws = worksheets.get(title)
+            if ws is None:
+                ws = book.add_worksheet(title, rows=max(1000, len(data)), cols=13)
+                worksheets[title] = ws
+            needed_rows = max(ws.row_count, len(data))
+            if ws.col_count < 13 or ws.row_count < needed_rows:
+                ws.resize(rows=needed_rows, cols=max(13, ws.col_count))
+            requests.append({'repeatCell': {'range': {'sheetId': ws.id, 'startRowIndex': 1, 'startColumnIndex': 0, 'endColumnIndex': 13}, 'cell': {}, 'fields': 'userEnteredValue'}})
+            formula = f'=IFNA(FILTER(Consolidado!A2:M,Consolidado!F2:F="{laser["external_id"]}"),"")'
+            requests.append({'updateCells': {'start': {'sheetId': ws.id, 'rowIndex': 0, 'columnIndex': 0}, 'rows': [{'values': [{'userEnteredValue': {'stringValue': h}} for h in HEADERS]}, {'values': [{'userEnteredValue': {'formulaValue': formula}}]}], 'fields': 'userEnteredValue'}})
+        # Reglas de color se instalan al preparar el Sheet; nuevas hojas reciben reglas aquí.
+        formatted = set(json.loads(meta.get('formatted_tabs', '[]')))
+        for title in ['Consolidado'] + [tab_name(l) for l in snapshot['lasers']]:
+            ws = worksheets[title]
+            if str(ws.id) not in formatted:
+                requests += formatting_requests(ws.id)
+                formatted.add(str(ws.id))
+        ordered = sorted(rows, key=lambda r: (int(r['ord']) if r['ord'].isdigit() else -1, r['ord'], r['id']), reverse=True)
+        write('Kyoodo', [['# DE ORDEN', 'LASER', 'SECUENCIA', 'COMENTARIO', 'LINEA', 'ID_REGISTRO']] + [[r['ord'], r['laser'], i, ' | '.join(filter(None, [r['comment'], r['alert']])), r['line'], r['request_id']] for i, r in enumerate(ordered, 1)])
+        write('Asignaciones', [['CODIGO_EMPLEADO', 'NOMBRE', 'LASER_ID']] + [[r['code'], r['name'], laser_map[r['laser_id']]['external_id'] if r['laser_id'] in laser_map else ''] for r in snapshot['employees']])
+        write('Cuentas CPA', [['LASER_ID', 'LASER', 'CUENTA_CPA']] + [[r['external_id'], r['name'], r['cpa_account']] for r in snapshot['lasers']])
         write('CPA DATA', [['Order', 'Set', 'Prod Line Pieces #']] + [[r['ord'], r['line'], r['qty']] for r in tables['cpa']])
-        # Recuperación completa; no compartir este Sheet con operadores.
+        if config_dirty:
+            write('Configuración', config)
         payload = json.dumps({'version': 1, 'tables': tables}, ensure_ascii=False)
         chunks = [payload[i:i + 30000] for i in range(0, len(payload), 30000)]
         write('_Estado', [['Corte SK2 backup v1', 'JSON (no editar)']] + [[i, chunk] for i, chunk in enumerate(chunks)])
-        book.batch_update({'requests': [{'updateSheetProperties': {'properties': {'sheetId': worksheets['_Estado'].id, 'hidden': True}, 'fields': 'hidden'}}]})
+        requests.append({'updateSheetProperties': {'properties': {'sheetId': worksheets['_Estado'].id, 'hidden': True}, 'fields': 'hidden'}})
+        # Estructura y fórmulas primero; un solo batch RAW para los datos.
+        if requests:
+            book.batch_update({'requests': requests})
+        book.values_batch_update({'valueInputOption': 'RAW', 'data': batches})
         with s.lock, s.db:
             current = s.db.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0]
             if current == revision:
                 s.db.execute("UPDATE meta SET value='0' WHERE key='dirty'")
-            for key, value in [('sync_at', stamp()), ('sync_error', '')]:
+                s.db.execute("UPDATE meta SET value='0' WHERE key='config_dirty'")
+            for key, value in [('sync_at', stamp()), ('sync_error', ''), ('formatted_tabs', json.dumps(sorted(formatted)))]:
                 s.db.execute('INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, value))
-
     def restore_empty(self):
         s = self.store
         with s.lock:
@@ -114,3 +229,16 @@ class SheetsSync:
         while True:
             self.sync()
             time.sleep(60)
+
+
+def formatting_requests(sid):
+    green, black = {'red': .22, 'green': 1, 'blue': .53}, {'red': .027, 'green': .047, 'blue': .039}
+    requests = [
+        {'repeatCell': {'range': {'sheetId': sid, 'startRowIndex': 0, 'endRowIndex': 1, 'startColumnIndex': 0, 'endColumnIndex': 13}, 'cell': {'userEnteredFormat': {'backgroundColor': black, 'textFormat': {'foregroundColor': green, 'bold': True}, 'wrapStrategy': 'WRAP'}}, 'fields': 'userEnteredFormat'}},
+        {'updateSheetProperties': {'properties': {'sheetId': sid, 'gridProperties': {'frozenRowCount': 1}}, 'fields': 'gridProperties.frozenRowCount'}},
+        {'updateDimensionProperties': {'range': {'sheetId': sid, 'dimension': 'COLUMNS', 'startIndex': 10, 'endIndex': 11}, 'properties': {'pixelSize': 420}, 'fields': 'pixelSize'}},
+        {'updateDimensionProperties': {'range': {'sheetId': sid, 'dimension': 'COLUMNS', 'startIndex': 11, 'endIndex': 13}, 'properties': {'hiddenByUser': True}, 'fields': 'hiddenByUser'}},
+    ]
+    for color, rgb in [('red', {'red': 1, 'green': .72, 'blue': .72}), ('yellow', {'red': 1, 'green': .92, 'blue': .55})]:
+        requests.append({'addConditionalFormatRule': {'index': 0, 'rule': {'ranges': [{'sheetId': sid, 'startRowIndex': 1, 'startColumnIndex': 0, 'endColumnIndex': 13}], 'booleanRule': {'condition': {'type': 'CUSTOM_FORMULA', 'values': [{'userEnteredValue': f'=$L2="{color}"'}]}, 'format': {'backgroundColor': rgb, 'textFormat': {'foregroundColor': {'red': .1, 'green': .05, 'blue': .05}}}}}}})
+    return requests

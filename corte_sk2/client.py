@@ -217,8 +217,9 @@ class Desktop(tk.Tk):
             ttk.Label(self.capture, text='Láser').grid(row=0, column=0, sticky='w')
             self.report_laser = ttk.Combobox(self.capture, textvariable=self.laser_choice, state='readonly', width=18)
             self.report_laser.grid(row=1, column=0, padx=(0, 8))
+        self.report_date = tk.StringVar(value=self.data['today'])
         offset = 1 if self.supervisor else 0
-        for index, (label, variable, width) in enumerate([('Orden (u ORDEN|SET)', self.order, 24), ('Línea / Set', self.line, 12), ('Piezas', self.qty, 10), ('Comentario', self.comment, 26)], offset):
+        for index, (label, variable, width) in enumerate([('Fecha AAAA-MM-DD', self.report_date, 13), ('Orden (u ORDEN|SET)', self.order, 21), ('Línea / Set', self.line, 12), ('Piezas', self.qty, 10), ('Comentario', self.comment, 18)], offset):
             ttk.Label(self.capture, text=label).grid(row=0, column=index, sticky='w')
             entry = ttk.Entry(self.capture, textvariable=variable, width=width)
             entry.grid(row=1, column=index, padx=(0, 8), sticky='ew')
@@ -241,7 +242,7 @@ class Desktop(tk.Tk):
         ttk.Button(tools, text='Actualizar', command=self.refresh).pack(side='right')
         table_frame = ttk.Frame(self.report_tab)
         table_frame.pack(fill='both', expand=True)
-        cols = ('created', 'laser', 'ord', 'line', 'qty', 'employee', 'comment', 'alert')
+        cols = ('report_date', 'laser', 'ord', 'line', 'qty', 'employee', 'comment', 'alert')
         self.table = ttk.Treeview(table_frame, columns=cols, show='headings', selectmode='browse')
         for col, title, width in zip(cols, ['Fecha / hora', 'Láser', 'Orden', 'Línea', 'Piezas', 'Empleado', 'Comentario', 'Validación'], [165, 120, 105, 65, 65, 95, 190, 450]):
             self.table.heading(col, text=title)
@@ -269,7 +270,7 @@ class Desktop(tk.Tk):
             return
         self.parse_barcode()
         laser_id = self.laser_id(self.laser_choice.get()) if self.supervisor else None
-        fields = {'order': self.order.get().strip(), 'line': self.line.get().strip(), 'qty': self.qty.get().strip(), 'comment': self.comment.get(), 'reprint': self.reprint.get(), 'laser_id': laser_id}
+        fields = {'order': self.order.get().strip(), 'line': self.line.get().strip(), 'qty': self.qty.get().strip(), 'comment': self.comment.get(), 'reprint': self.reprint.get(), 'laser_id': laser_id, 'report_date': self.report_date.get().strip()}
         if self.pending_report and fields != self.pending_report['fields']:
             messagebox.showwarning('Envío pendiente', 'El envío anterior no se confirmó. Restaura sus datos y reintenta antes de registrar otro. Si persiste, consulta al supervisor.')
             return
@@ -304,8 +305,8 @@ class Desktop(tk.Tk):
     def make_management(self):
         toolbar = ttk.Frame(self.management_tab)
         toolbar.pack(fill='x', pady=(0, 15))
-        for label, command in [('Nuevo empleado', self.add_employee), ('Nueva láser', self.add_laser), ('Editar láser / cuenta CPA', self.edit_laser), ('Quitar asignación', self.unassign), ('Cargar base CPA', self.import_cpa), ('Sincronizar Sheets', self.sync)]:
-            ttk.Button(toolbar, text=label, command=command).pack(side='left', padx=(0, 6))
+        for index, (label, command) in enumerate([('Nuevo empleado', self.add_employee), ('Nueva láser', self.add_laser), ('Editar láser / cuenta CPA', self.edit_laser), ('Quitar asignación', self.unassign), ('Activar / desactivar', self.toggle_laser), ('Cargar base CPA', self.import_cpa), ('Sincronizar Sheets', self.sync)]):
+            ttk.Button(toolbar, text=label, command=command).grid(row=index // 4, column=index % 4, sticky='ew', padx=(0, 6), pady=3)
         ttk.Label(self.management_tab, text='Arrastra un empleado de la izquierda sobre su láser. También puedes seleccionarlos y pulsar ASIGNAR.', foreground=MUTED).pack(anchor='w', pady=12)
         body = ttk.Frame(self.management_tab)
         body.pack(fill='both', expand=True)
@@ -349,6 +350,16 @@ class Desktop(tk.Tk):
         employee = self.selected_employee()
         if employee:
             self.job(lambda: self.api.call('/assign', code=employee['code'], laser_id=None), lambda _: self.refresh())
+
+    def toggle_laser(self):
+        laser = self.selected_laser()
+        if not laser:
+            messagebox.showinfo('Láser', 'Selecciona una láser.')
+            return
+        active = not bool(laser.get('active', 1))
+        if not active and not messagebox.askyesno('Desactivar láser', 'Se quitarán sus asignaciones y se conservará el historial. ¿Continuar?'):
+            return
+        self.job(lambda: self.api.call('/laser-active', laser_id=laser['id'], active=active), lambda _: self.refresh())
 
     def add_employee(self):
         code = simpledialog.askstring('Nuevo empleado', 'Código de empleado:', parent=self)
@@ -407,7 +418,7 @@ class Desktop(tk.Tk):
         if not self.data or not self.supervisor:
             return
         self.chart.delete('all')
-        today = [r for r in self.data['reports'] if r['created'][:10] == self.data['today']]
+        today = [r for r in self.data['reports'] if r['report_date'] == self.data['today']]
         totals = [(l['name'], sum(r['qty'] for r in today if r['laser_id'] == l['id'])) for l in self.data['lasers']]
         if not totals:
             self.chart.create_text(30, 30, text='Crea las láseres para empezar.', fill=GREEN, anchor='nw')
@@ -428,7 +439,7 @@ class Desktop(tk.Tk):
         previous_laser = self.selected_laser() if self.supervisor and self.data and self.laser_list.size() else None
         self.data = data
         user = data['user']
-        if not self.supervisor and user['laser_id'] is None:
+        if not self.supervisor and (user['laser_id'] is None or not data['lasers']):
             self.capture.pack_forget()
             self.waiting.place(relx=.5, rely=.45, anchor='center')
             self.waiting.lift()
@@ -436,10 +447,10 @@ class Desktop(tk.Tk):
             self.waiting.place_forget()
             if not self.capture.winfo_manager():
                 self.capture.pack(fill='x', after=self.report_tab.winfo_children()[0])
-        today = [r for r in data['reports'] if r['created'][:10] == data['today']]
+        today = [r for r in data['reports'] if r['report_date'] == data['today']]
         self.metrics.set(f"HOY  {sum(r['qty'] for r in today):,} piezas  /  {len(today)} registros  /  {sum(bool(r['alert']) for r in today)} incidencias")
         if self.supervisor:
-            names = [r['name'] for r in data['lasers']]
+            names = [r['name'] for r in data['lasers'] if r.get('active', 1)]
             self.report_laser['values'] = names
             if self.laser_choice.get() not in names:
                 self.laser_choice.set(names[0] if names else '')
@@ -457,7 +468,7 @@ class Desktop(tk.Tk):
                     self.employee_list.selection_set(i)
             for i, laser in enumerate(data['lasers']):
                 count = sum(e['laser_id'] == laser['id'] for e in data['employees'])
-                self.laser_list.insert('end', f"{laser['name']}  /  {count} operadores  /  CPA: {laser['cpa_account'] or 'sin cuenta'}")
+                self.laser_list.insert('end', f"{laser['name']} {'[INACTIVA]' if not laser.get('active', 1) else ''} / {count} operadores / CPA: {laser['cpa_account'] or 'sin cuenta'}")
                 if selected_laser and selected_laser['id'] == laser['id']:
                     self.laser_list.selection_set(i)
             self.draw_chart()
@@ -469,13 +480,13 @@ class Desktop(tk.Tk):
     def paint_rows(self):
         self.table.delete(*self.table.get_children())
         for r in self.data['reports']:
-            if self.only_today.get() and r['created'][:10] != self.data['today']:
+            if self.only_today.get() and r['report_date'] != self.data['today']:
                 continue
             if self.only_alerts.get() and not r['alert']:
                 continue
             if self.supervisor and self.filter_laser.get() not in ('Todas', r['laser']):
                 continue
-            self.table.insert('', 'end', iid=str(r['id']), values=[r[k] for k in ('created', 'laser', 'ord', 'line', 'qty', 'employee', 'comment', 'alert')], tags=(r['color'],))
+            self.table.insert('', 'end', iid=str(r['id']), values=[r[k] for k in ('report_date', 'laser', 'ord', 'line', 'qty', 'employee', 'comment', 'alert')], tags=(r['color'],))
 
     def show_detail(self, event=None):
         selection = self.table.selection()
